@@ -59,7 +59,12 @@ export async function createHarness() {
     },
     webServer: {
       register(definition) {
+        // 真宿主在重复注册同一路径时抛错，插件据此判断上一次有没有清理干净。
+        if (route) throw new Error('webserver: duplicate exact route')
         route = definition
+        return () => {
+          if (route === definition) route = null
+        }
       },
     },
     on(event, handler) {
@@ -93,7 +98,17 @@ export async function createHarness() {
     return tool.execute(args)
   }
 
-  const readStore = () => JSON.parse(readFileSync(storeFile, 'utf8'))
+  // 没有写入过的仓库文件不存在，读它就是「空仓库」，不该当成失败。
+  const readStore = () => {
+    try {
+      return JSON.parse(readFileSync(storeFile, 'utf8'))
+    } catch (error) {
+      if (error?.code === 'ENOENT') {
+        return { version: 2, entries: [], applications: { global: { enabled: [] }, workspaces: {} }, temporary: [], overrides: {} }
+      }
+      throw error
+    }
+  }
 
   /** 模拟一个会话：触发 agent/created，拿到它的静态注册与 assemble hook。 */
   const createAgent = (sessionId, cwd = '', header = {}) => {
@@ -129,7 +144,7 @@ export async function createHarness() {
     }
   }
 
-  const callHttp = (path) =>
+  const callHttp = (path, init = {}) =>
     new Promise((resolve, reject) => {
       const response = {
         statusCode: 0,
@@ -139,13 +154,26 @@ export async function createHarness() {
         },
         end(body) {
           try {
-            resolve({ status: this.statusCode, body: JSON.parse(body || '{}') })
+            resolve({ status: this.statusCode, headers: this.headers, body: JSON.parse(body || '{}') })
           } catch (error) {
             reject(error)
           }
         },
       }
-      route.handler({ method: 'GET', url: path, headers: {} }, response)
+      const payload = init.body ?? ''
+      const request = {
+        method: init.method ?? 'GET',
+        url: path,
+        headers: { host: '127.0.0.1:62654', ...(init.headers ?? {}) },
+        async *[Symbol.asyncIterator]() {
+          if (payload) yield Buffer.from(payload, 'utf8')
+        },
+      }
+      if (!route) {
+        reject(new Error('route is not registered'))
+        return
+      }
+      Promise.resolve(route.handler(request, response)).catch(reject)
     })
 
   const cleanup = () => rmSync(dir, { recursive: true, force: true })
@@ -156,6 +184,7 @@ export async function createHarness() {
     callTool,
     callHttp,
     createAgent,
+    emit,
     readStore,
     cleanup,
     getTool: () => tool,

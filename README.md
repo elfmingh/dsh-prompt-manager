@@ -80,6 +80,22 @@ dsh plugin --profile web update @vertixara/dsh-prompt-manager@latest
 
 因此 `override.set` 的 `mode` 有三种：`disable`、`replace`（需 `text`）、`enable`。
 
+## 👪 谁能看到什么
+
+档案条目和临时条目都能标作用域：
+
+| 标记 | 注入给 |
+|---|---|
+| 主代理 + 子代理（默认） | 两者都注入 |
+| 仅主代理 | 只有主会话 |
+| 仅子代理 | 只有它派生的子代理 |
+
+判定依据是框架写进 `SessionHeader` 的 `origin` / `parentSession` / `delegationDepth`，插件不自己推断。
+
+临时条目写在「打开它的那个会话」名下，但会沿父链传给该会话派生的子代理、孙代理 —— 否则在会话页给子代理写的东西永远到不了子代理。无关会话之间照旧隔离。
+
+所有提示词都按**字面量**注入：`{{...}}` 不会被当成变量解析。宿主默认会解析，遇到未定义的变量直接抛异常让整轮装配失败，写一句模板示例就能搞坏一个会话。
+
 ## 🧭 核心概念
 
 | 概念 | 是什么 | 存在哪 |
@@ -183,6 +199,16 @@ HTTP 端点挂在 `/prompt-manager/api`，都接受 `sessionId`：
 | `?view=system` | ⚠️ **已废弃**，响应带 `deprecated: true`，仅宿主作用域调试用 |
 
 `?view=system` 拿不到 agent 作用域的内容（`assemble({})` 不传 scope，waterfall 不派发给 scoped listener），返回的宿主段落与真实提示词不一致，容易误导。面板一律用 `?view=assembled` —— 后者由 waterfall 每轮记录，没产生过装配的会话会返回 `ok:false` 加原因。
+
+### 端点安全
+
+路由直接挂在宿主的 `webServer` 上，宿主不提供统一的认证或来源策略，所以由插件自己守：
+
+- 带 `Origin` 且与 `Host` 不同源 → `403`
+- 写操作必须是 `content-type: application/json` —— 跨站的「简单请求」发不出这个类型，浏览器会先预检，而本路由不返回任何 CORS 响应头，预检必然失败
+- 请求体上限 1 MB
+
+挡不住的是本机任意进程：它本来就能直接读 `$DSH_HOME/prompt-manager.json`。这里防的是浏览器跨站。
 
 ## 🛠️ 开发
 

@@ -1,5 +1,5 @@
 /**
- * @vertixara/dsh-prompt-manager  (0.2.0，数据模型 v2)
+ * @vertixara/dsh-prompt-manager  (0.2.1，数据模型 v2)
  *
  * 数据模型 v2 —— "档案 / 应用 / 临时"三分：
  *   entries      长期条目档案：只存定义 { id, title, text, order }，不带作用域
@@ -16,7 +16,7 @@
  * 存储：$DSH_HOME/prompt-manager.json（v1 文档在加载时自动迁移并回写）
  * 管理：模型工具 `prompt_manager` + Web UI + HTTP 路由 /prompt-manager/api
  */
-import { readFile, writeFile } from 'node:fs/promises'
+import { readFile, writeFile, rename, unlink } from 'node:fs/promises'
 import { watch, appendFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
@@ -59,7 +59,34 @@ function stringList(value) {
   return result
 }
 
+/**
+ * 模块级 disposer 队列。
+ *
+ * 宿主不会替我们管理这条路由的生命周期：`webServer.register()` 返回的删除函数
+ * 如果丢掉，热卸载或重新 apply 之后，旧 handler 会一直持有旧 state 继续应答，
+ * 而新 host 注册同一路径会撞上 duplicate route。放在模块级而不是闭包里，是为了
+ * 让「下一次 apply」能先摘掉「上一次」留下的东西。
+ */
+const moduleDisposers = []
+
+function trackDisposer(dispose) {
+  if (typeof dispose === 'function') moduleDisposers.push(dispose)
+}
+
+function disposeAll() {
+  while (moduleDisposers.length) {
+    const dispose = moduleDisposers.pop()
+    try {
+      dispose()
+    } catch {
+      /* 清理失败不应阻断后续清理 */
+    }
+  }
+}
+
 export function apply(ctx, config = {}) {
+  // 上一次 apply 的残留先摘掉，否则注册同一路径会抛 duplicate route。
+  disposeAll()
   const storeFile = (config && config.storeFile) || join(dshHome(), 'prompt-manager.json')
   const state = { document: emptyDocument() }
   const agentCleanups = new Map()
@@ -71,6 +98,21 @@ export function apply(ctx, config = {}) {
   const sessionBaselines = new Map()
   let watcher = null
   let reloadTimer = null
+  /**
+   * 写事务队列。
+   *
+   * 每次修改都是「读整份文档 → 改 → 整份写回」。两个调用并发时，它们各自读到
+   * 同一个旧版本，先后写回，后写的那次把先写的成果整个抹掉，而两边都拿到成功
+   * 响应。做法是把整个事务串起来，且在锁内重新读盘，保证基于最新状态修改。
+   */
+  let writeChain = Promise.resolve()
+
+  function withWriteLock(task) {
+    const run = writeChain.then(() => task())
+    // 队列本身不能被 rejection 打断，否则一个失败会毒化后续所有写。
+    writeChain = run.then(() => {}, () => {})
+    return run
+  }
 
   // ------------------------------------------------------------ diagnostics
 
@@ -353,7 +395,21 @@ export function apply(ctx, config = {}) {
 
   async function saveStore(document) {
     const normalized = normalizeDocument(document)
-    await writeFile(storeFile, `${JSON.stringify(normalized, null, 2)}\n`, 'utf8')
+    const payload = `${JSON.stringify(normalized, null, 2)}\n`
+    // 先写临时文件再原子替换：直接覆盖的话，写到一半出错会留下半截 JSON，
+    // 下次启动就整份读不出来。rename 在同一个卷上是原子的。
+    const tempFile = `${storeFile}.${process.pid}-${Date.now().toString(36)}.tmp`
+    try {
+      await writeFile(tempFile, payload, 'utf8')
+      await rename(tempFile, storeFile)
+    } catch (error) {
+      try {
+        await unlink(tempFile)
+      } catch {
+        /* 临时文件可能根本没建立，清理失败不影响主错误 */
+      }
+      throw error
+    }
     state.document = normalized
     return normalized
   }
@@ -403,6 +459,23 @@ export function apply(ctx, config = {}) {
     } catch {
       return { subagent: false, parentSessionId: '' }
     }
+  }
+
+  /**
+   * 会话的祖先链（含自身）。
+   *
+   * 临时条目写在「打开它的那个会话」名下，但那个会话派生的子代理、孙代理
+   * 也应当看得到 —— 否则 UI 里选「仅子代理」的临时条目永远到不了任何子代理。
+   * 链上每一节的 parentSessionId 由框架写进 SessionHeader，这里顺着走即可。
+   */
+  function sessionLineage(sessionId) {
+    const chain = new Set()
+    let current = sessionId
+    while (current && !chain.has(current)) {
+      chain.add(current)
+      current = sessionFacts.get(current)?.parentSessionId ?? ''
+    }
+    return chain
   }
 
   /** agentScope 过滤：inherit 总是注入，main 只给主代理，subagent 只给子代理。 */
@@ -464,6 +537,7 @@ export function apply(ctx, config = {}) {
     const workspaceKey = matchWorkspaceKey(facts?.cwd)
     const workspace = workspaceKey ? document.applications.workspaces[workspaceKey] : undefined
     const disabled = new Set(workspace?.disabled ?? [])
+    const lineage = sessionLineage(facts?.sessionId)
     const items = []
     if (workspace?.hotReload === true) {
       for (const entry of document.entries) {
@@ -475,7 +549,8 @@ export function apply(ctx, config = {}) {
     }
     for (const temporary of document.temporary) {
       if (!allowForScope(temporary, facts)) continue
-      if (temporary.sessionId && (!facts?.sessionId || temporary.sessionId !== facts.sessionId)) continue
+      // 按祖先链判定可见范围：主会话写的临时条目，它派生的子代理也看得到。
+      if (temporary.sessionId && !lineage.has(temporary.sessionId)) continue
       items.push({
         source: 'temporary',
         id: temporary.id,
@@ -558,6 +633,9 @@ export function apply(ctx, config = {}) {
           name: sectionName(item.id, item.source),
           order: item.order,
           text: item.text,
+          // 用户文本原样注入：不声明这一项，宿主会把 {{name}} 当变量引用，
+          // 遇到未知变量直接抛异常，让整个会话装配失败。
+          interpolate: false,
         }))
       } catch (error) {
         log(`register-failed ${item.id}: ${error?.message ?? error}`)
@@ -651,7 +729,8 @@ export function apply(ctx, config = {}) {
             const rule = sectionRules[section?.name]
             if (rule?.mode === 'disable') continue
             if (rule?.mode === 'replace') {
-              sections.push({ ...section, text: rule.text })
+              // 覆盖文本同样是用户输入，不能当模板解析。
+              sections.push({ ...section, text: rule.text, interpolate: false })
               continue
             }
             sections.push(section)
@@ -663,19 +742,23 @@ export function apply(ctx, config = {}) {
             const rule = contextRules[context?.name]
             if (rule?.mode === 'disable') continue
             if (rule?.mode === 'replace') {
-              contexts.push({ ...context, text: rule.text })
+              contexts.push({ ...context, text: rule.text, interpolate: false })
               continue
             }
             contexts.push(context)
           }
 
           // 3) 再追加动态层；已被 disable 的段落不再追加回来。
+          //    动态条目在装配开始时还不存在，所以 replace 只能在这里应用——
+          //    上面那一轮只覆盖宿主已装配的段落，漏了这里规则就等于白存。
           const existing = new Set(sections.map((section) => section?.name))
           const allExtras = []
           for (const item of items) {
             const name = sectionName(item.id, item.source)
             if (existing.has(name)) continue
-            allExtras.push({ name, text: item.text })
+            const rule = sectionRules[name]
+            const text = rule?.mode === 'replace' ? rule.text : item.text
+            allExtras.push({ name, text, interpolate: false })
           }
           // 被禁用的动态条目仍要记进快照，否则面板上没有入口把它打开。
           const extras = allExtras.filter((entry) => sectionRules[entry.name]?.mode !== 'disable')
@@ -730,6 +813,14 @@ export function apply(ctx, config = {}) {
         }, 150)
       })
       watcher.on?.('error', () => {})
+      trackDisposer(() => {
+        watcher?.close?.()
+        watcher = null
+        if (reloadTimer) {
+          clearTimeout(reloadTimer)
+          reloadTimer = null
+        }
+      })
     } catch (error) {
       watcher = null
       diag(`watcher-create-failed ${error?.message ?? error}`)
@@ -795,7 +886,17 @@ export function apply(ctx, config = {}) {
       render: (_args, value) => [{ type: 'text', text: String(value) }],
     },
     async execute(args) {
-      const action = String(args?.action ?? 'list').toLowerCase()
+      // 所有 action 串行执行，并在锁内重新读盘：并发调用若各自基于内存里的同一份
+      // 旧文档修改再写回，就会互相覆盖——两边都返回成功，却只剩一个结果。
+      return withWriteLock(async () => {
+        await loadStore()
+        return runAction(args)
+      })
+    },
+  }
+
+  async function runAction(args) {
+    const action = String(args?.action ?? 'list').toLowerCase()
 
       if (action === 'path') {
         return `${storeFile}\n(${summary()})`
@@ -867,8 +968,11 @@ export function apply(ctx, config = {}) {
             enabled: value.enabled.filter((item) => item !== id),
             disabled: value.disabled.filter((item) => item !== id),
             default: value.default.filter((item) => item !== id),
+            // hotReload 属于工作区自己，与删哪条档案无关；重建时漏掉它，
+            // 会让删除一条无关条目顺手关掉别处配置好的后注入。
+            hotReload: value.hotReload === true,
           }
-          if (next.enabled.length || next.disabled.length || next.default.length) {
+          if (next.enabled.length || next.disabled.length || next.default.length || next.hotReload) {
             applications.workspaces[key] = next
           }
         }
@@ -929,7 +1033,9 @@ export function apply(ctx, config = {}) {
         refreshRunningAgents()
         return `${key} 的默认条目${args?.isDefault === false ? '取消' : '设为'} ${id}`
       }
-      if (action === 'apply.hotReload') {
+      // action 在上面统一转成小写，这里必须用全小写的规范形式比较，
+      // 否则分支永远匹配不上（历史 bug：写的是 apply.hotReload）。
+      if (action === 'apply.hotreload') {
         const document = state.document
         const key = normalizePathValue(args?.workspacePath)
         if (!key) return 'error: apply.hotReload 需要 workspacePath'
@@ -1088,6 +1194,9 @@ export function apply(ctx, config = {}) {
             }
           }
         }
+        // 基线是「会话开始那一刻的全局规则」副本。全量恢复若只清磁盘不清它，
+        // 运行中的会话会在下次打开总开关时把刚清掉的旧规则复活。
+        sessionBaselines.clear()
         await saveStore({
           ...document,
           overrides: {
@@ -1174,7 +1283,6 @@ export function apply(ctx, config = {}) {
         return `已删除临时条目 ${id}`
       }
       return `error: 未知 action ${action}`
-    },
   }
 
   // ------------------------------------------------------------- http route
@@ -1206,8 +1314,54 @@ export function apply(ctx, config = {}) {
     }
   }
 
+  /**
+   * 请求体上限。提示词是文本，1 MB 已经远超正常用例。
+   */
+  const MAX_BODY_BYTES = 1024 * 1024
+
+  /**
+   * 路由守卫。
+   *
+   * 这条路由直接挂在宿主的 webServer 上，宿主不提供统一的认证或来源策略，
+   * 所以能连到这个端口的东西都能读写提示词。主要威胁来自浏览器：别的站点可以
+   * 用「简单请求」（text/plain 表单）向本机端口发 POST —— 这类请求不触发预检，
+   * 也就绕过了 CORS。因此：
+   *
+   *   1. 带 Origin 且与 Host 不同源的一律拒绝（正常前端是同源页面）；
+   *   2. POST 必须是 application/json —— 简单请求发不出这个类型，浏览器会先
+   *      预检，而本路由不返回任何 CORS 响应头，预检必然失败；
+   *   3. 限制请求体大小。
+   *
+   * 本机任意进程挡不住（它本来就能直接读 store 文件），这里防的是跨站。
+   */
+  function guardRequest(request) {
+    const origin = request.headers?.origin
+    if (typeof origin === 'string' && origin) {
+      let originHost = ''
+      try {
+        originHost = new URL(origin).host
+      } catch {
+        return { status: 403, error: 'malformed origin' }
+      }
+      if (originHost !== String(request.headers?.host ?? '')) {
+        return { status: 403, error: 'cross-origin request rejected' }
+      }
+    }
+    if (request.method === 'POST') {
+      const type = String(request.headers?.['content-type'] ?? '').toLowerCase()
+      if (!type.startsWith('application/json')) {
+        return { status: 415, error: 'POST requires content-type: application/json' }
+      }
+      const length = Number(request.headers?.['content-length'] ?? 0)
+      if (Number.isFinite(length) && length > MAX_BODY_BYTES) {
+        return { status: 413, error: 'request body too large' }
+      }
+    }
+    return null
+  }
+
   try {
-    ctx.webServer.register({
+    const disposeRoute = ctx.webServer.register({
       kind: 'exact',
       path: '/prompt-manager/api',
       handler: async (request, response) => {
@@ -1218,6 +1372,11 @@ export function apply(ctx, config = {}) {
           response.end(JSON.stringify(value))
         }
         try {
+          const rejection = guardRequest(request)
+          if (rejection) {
+            send(rejection.status, { ok: false, error: rejection.error })
+            return
+          }
           if (request.method === 'GET') {
             await loadStore()
             const url = new URL(request.url || '/', 'http://127.0.0.1')
@@ -1398,7 +1557,14 @@ export function apply(ctx, config = {}) {
             return
           }
           let raw = ''
-          for await (const chunk of request) raw += chunk
+          for await (const chunk of request) {
+            raw += chunk
+            // chunked 编码没有 content-length，必须边读边挡。
+            if (raw.length > MAX_BODY_BYTES) {
+              send(413, { ok: false, error: 'request body too large' })
+              return
+            }
+          }
           const args = raw ? JSON.parse(raw) : {}
           const result = await toolDefinition.execute(args)
           if (String(result).startsWith('error:')) {
@@ -1412,6 +1578,7 @@ export function apply(ctx, config = {}) {
         }
       },
     })
+    trackDisposer(disposeRoute)
     diag('http-route-registered')
   } catch (error) {
     diag(`http-route-failed ${error?.stack ?? error}`)
@@ -1462,6 +1629,16 @@ export function apply(ctx, config = {}) {
     diag('watcher-started')
   } catch (error) {
     diag(`watcher-failed ${error?.stack ?? error}`)
+  }
+
+  // 插件卸载 / 热重载时摘掉路由、watcher 与定时器。事件名按宿主实际提供的来，
+  // 不存在就静默跳过——但不能不注册，否则旧 handler 会一直留在宿主的路由表里。
+  for (const event of ['dispose', 'teardown']) {
+    try {
+      ctx.on(event, disposeAll)
+    } catch {
+      /* 宿主没有这个事件 */
+    }
   }
 
   diag('apply-ready v2')
