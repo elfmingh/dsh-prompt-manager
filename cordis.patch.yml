@@ -1,0 +1,5 @@
+# Host rows inserted by @local/dsh-prompt-manager.
+- insert:
+    - id: prompt-manager
+      name: '@local/dsh-prompt-manager'
+      config: {}

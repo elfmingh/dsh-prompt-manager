@@ -1,0 +1,1468 @@
+/**
+ * @local/dsh-prompt-manager  (v2)
+ *
+ * 数据模型 v2 —— "档案 / 应用 / 临时"三分：
+ *   entries      长期条目档案：只存定义 { id, title, text, order }，不带作用域
+ *   applications 应用关系：
+ *                  global.enabled[]                              全局启用的条目
+ *                  workspaces[<cwd>] = { enabled[], disabled[], default[] }
+ *                                                                每个工作区独立的启用 / 禁用 / 默认组
+ *   temporary    临时条目：直接绑定 sessionId，不进档案
+ *
+ * 生效解析（对某个 agent）：
+ *   全局启用 ∪ 工作区启用 − 工作区禁用 ∪ 该会话临时条目，按 order 排序。
+ *   全部注册在 agent 作用域，所以"某工作区禁用某全局条目"能真正生效。
+ *
+ * 存储：$DSH_HOME/prompt-manager.json（v1 文档在加载时自动迁移并回写）
+ * 管理：模型工具 `prompt_manager` + Web UI + HTTP 路由 /prompt-manager/api
+ */
+import { readFile, writeFile } from 'node:fs/promises'
+import { watch, appendFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { homedir } from 'node:os'
+
+const STORE_VERSION = 2
+const DEFAULT_ORDER = 9000
+const SECTION_PREFIX = 'prompt-manager:'
+
+export const inject = ['systemPrompt', 'tools', 'webServer']
+
+function dshHome() {
+  return process.env.DSH_HOME || join(homedir(), '.dsh')
+}
+
+function nowIso() {
+  return new Date().toISOString()
+}
+
+function normalizePathValue(value) {
+  return String(value ?? '')
+    .replace(/\\/g, '/')
+    .replace(/\/+$/, '')
+    .toLowerCase()
+}
+
+function sectionName(id, source) {
+  return source === 'temporary' ? `${SECTION_PREFIX}temporary:${id}` : `${SECTION_PREFIX}${id}`
+}
+
+function stringList(value) {
+  if (!Array.isArray(value)) return []
+  const seen = new Set()
+  const result = []
+  for (const item of value) {
+    const text = typeof item === 'string' ? item.trim() : ''
+    if (!text || seen.has(text)) continue
+    seen.add(text)
+    result.push(text)
+  }
+  return result
+}
+
+export function apply(ctx, config = {}) {
+  const storeFile = (config && config.storeFile) || join(dshHome(), 'prompt-manager.json')
+  const state = { document: emptyDocument() }
+  const agentCleanups = new Map()
+  const runningAgents = new Map()
+  const sessionFacts = new Map()
+  // 最近一次真实装配的内容，按 sessionId 存放，供面板枚举 agent 作用域的段落。
+  const assemblySnapshots = new Map()
+  // 每个会话启动时冻结的全局规则：主页的改动只对新会话生效，避免中途改动把缓存前缀打掉。
+  const sessionBaselines = new Map()
+  let watcher = null
+  let reloadTimer = null
+
+  // ------------------------------------------------------------ diagnostics
+
+  function diag(message) {
+    try {
+      appendFileSync(join(dshHome(), 'prompt-manager-debug.log'), `${nowIso()} ${message}\n`)
+    } catch {
+      /* diagnostics are best effort */
+    }
+  }
+
+  function log(message) {
+    diag(message)
+  }
+
+  // --------------------------------------------------------- document model
+
+  function emptyDocument() {
+    return {
+      version: STORE_VERSION,
+      entries: [],
+      applications: { global: { enabled: [] }, workspaces: {} },
+      temporary: [],
+      // 内置段落改写：enabled 是总开关，sections 按段落名存放 disable / replace 规则。
+      overrides: {
+        enabled: false,
+        sections: {},
+        contexts: {},
+        sessionSections: {},
+        sessionContexts: {},
+        saved: [],
+      },
+    }
+  }
+
+  function normalizeOrder(value) {
+    return Number.isFinite(value) ? value : DEFAULT_ORDER
+  }
+
+  /** 条目对哪类代理生效：inherit（都注入）/ main（仅主代理）/ subagent（仅子代理）。 */
+  function normalizeAgentScope(value) {
+    return value === 'main' || value === 'subagent' ? value : 'inherit'
+  }
+
+  function normalizeEntry(raw) {
+    if (!raw || typeof raw !== 'object') return undefined
+    const id = typeof raw.id === 'string' && raw.id.trim() ? raw.id.trim() : undefined
+    if (!id) return undefined
+    const text = typeof raw.text === 'string' ? raw.text : ''
+    if (!text.trim()) return undefined
+    return {
+      id,
+      title: typeof raw.title === 'string' && raw.title.trim() ? raw.title.trim() : id,
+      text,
+      order: normalizeOrder(raw.order),
+      agentScope: normalizeAgentScope(raw.agentScope),
+    }
+  }
+
+  function normalizeTemporary(raw) {
+    if (!raw || typeof raw !== 'object') return undefined
+    const id = typeof raw.id === 'string' && raw.id.trim() ? raw.id.trim() : undefined
+    const text = typeof raw.text === 'string' ? raw.text : ''
+    if (!id || !text.trim()) return undefined
+    return {
+      id,
+      sessionId: typeof raw.sessionId === 'string' ? raw.sessionId.trim() : '',
+      title: typeof raw.title === 'string' && raw.title.trim() ? raw.title.trim() : id,
+      text,
+      order: normalizeOrder(raw.order),
+      agentScope: normalizeAgentScope(raw.agentScope),
+      createdAt: typeof raw.createdAt === 'string' ? raw.createdAt : nowIso(),
+    }
+  }
+
+  function normalizeWorkspaceConfig(raw) {
+    return {
+      enabled: stringList(raw?.enabled),
+      disabled: stringList(raw?.disabled),
+      default: stringList(raw?.default),
+      hotReload: raw?.hotReload === true,
+    }
+  }
+
+  function normalizeApplications(raw) {
+    const applications = { global: { enabled: stringList(raw?.global?.enabled) }, workspaces: {} }
+    const workspaces = raw && typeof raw.workspaces === 'object' && raw.workspaces ? raw.workspaces : {}
+    for (const [key, value] of Object.entries(workspaces)) {
+      const path = normalizePathValue(key)
+      if (!path) continue
+      const config = normalizeWorkspaceConfig(value)
+      // 丢弃空配置：删除档案后不留空壳，避免工作区下拉里出现幽灵项。
+      if (!config.enabled.length && !config.disabled.length && !config.default.length && !config.hotReload) continue
+      applications.workspaces[path] = config
+    }
+    return applications
+  }
+
+  /**
+   * v1 → v2。v1 每条记录自带 scope：
+   *   global    → 档案 + applications.global.enabled
+   *   workspace → 档案 + workspaces[workspacePath].enabled
+   *   context   → 档案 + workspaces[match.cwdPrefix].enabled（cwd 条件并入工作区语义）
+   *   session   → 档案 + temporary（保留 sessionId 绑定）
+   */
+  function migrateV1(raw) {
+    const document = emptyDocument()
+    const legacy = Array.isArray(raw?.entries) ? raw.entries : []
+    for (const item of legacy) {
+      const entry = normalizeEntry(item)
+      if (!entry) continue
+      document.entries.push(entry)
+      const active = item?.enabled !== false
+      if (!active) continue
+      if (item?.scope === 'session' && typeof item?.sessionId === 'string' && item.sessionId.trim()) {
+        const temporary = normalizeTemporary({
+          id: entry.id,
+          sessionId: item.sessionId,
+          title: entry.title,
+          text: entry.text,
+          order: entry.order,
+        })
+        if (temporary) document.temporary.push(temporary)
+        continue
+      }
+      const workspaceKey = item?.scope === 'workspace'
+        ? normalizePathValue(item?.workspacePath)
+        : item?.scope === 'context'
+          ? normalizePathValue(item?.match?.cwdPrefix)
+          : ''
+      if (workspaceKey) {
+        const config = document.applications.workspaces[workspaceKey] ?? { enabled: [], disabled: [], default: [] }
+        if (!config.enabled.includes(entry.id)) config.enabled.push(entry.id)
+        document.applications.workspaces[workspaceKey] = config
+        continue
+      }
+      if (!document.applications.global.enabled.includes(entry.id)) {
+        document.applications.global.enabled.push(entry.id)
+      }
+    }
+    return document
+  }
+
+  function normalizeDocument(raw) {
+    if (!raw || typeof raw !== 'object') return emptyDocument()
+    const version = Number(raw.version ?? 1)
+    if (version < STORE_VERSION) return migrateV1(raw)
+    const document = emptyDocument()
+    const seen = new Set()
+    for (const item of Array.isArray(raw.entries) ? raw.entries : []) {
+      const entry = normalizeEntry(item)
+      if (!entry || seen.has(entry.id)) continue
+      seen.add(entry.id)
+      document.entries.push(entry)
+    }
+    document.applications = normalizeApplications(raw.applications)
+    document.overrides = normalizeOverrides(raw.overrides)
+    for (const item of Array.isArray(raw.temporary) ? raw.temporary : []) {
+      const temporary = normalizeTemporary(item)
+      if (temporary) document.temporary.push(temporary)
+    }
+    return document
+  }
+
+  function normalizeRuleMap(raw) {
+    const result = {}
+    const source = raw && typeof raw === 'object' ? raw : {}
+    for (const [name, value] of Object.entries(source)) {
+      const key = String(name ?? '').trim()
+      if (!key) continue
+      const mode = value?.mode === 'disable' ? 'disable'
+        : value?.mode === 'replace' ? 'replace'
+          : value?.mode === 'enable' ? 'enable'
+            : ''
+      if (!mode) continue
+      if (mode === 'replace') {
+        const text = typeof value?.text === 'string' ? value.text : ''
+        if (!text.trim()) continue
+        result[key] = { mode, text }
+        continue
+      }
+      // enable 用来在会话层推翻全局基线的 disable，恢复原文。
+      result[key] = { mode }
+    }
+    return result
+  }
+
+  function normalizeSavedOverrides(raw) {
+    const result = []
+    const seen = new Set()
+    for (const item of Array.isArray(raw) ? raw : []) {
+      const name = typeof item?.name === 'string' ? item.name.trim() : ''
+      const text = typeof item?.text === 'string' ? item.text : ''
+      const id = typeof item?.id === 'string' ? item.id.trim() : ''
+      if (!name || !text.trim() || !id || seen.has(id)) continue
+      seen.add(id)
+      const entry = {
+        id,
+        name,
+        layer: item?.layer === 'contexts' ? 'contexts' : 'sections',
+        text,
+        createdAt: typeof item?.createdAt === 'string' ? item.createdAt : nowIso(),
+      }
+      const sessionId = typeof item?.sessionId === 'string' ? item.sessionId.trim() : ''
+      if (sessionId) entry.sessionId = sessionId
+      result.push(entry)
+    }
+    return result.slice(0, 100)
+  }
+
+  /** 按会话的改写规则：{ [sessionId]: { [name]: rule } }，sections 与 contexts 共用同一形状。 */
+  function normalizeSessionRules(raw) {
+    const result = {}
+    for (const [key, rules] of Object.entries(raw ?? {})) {
+      const sessionId = String(key || '').trim()
+      if (!sessionId) continue
+      const normalized = normalizeRuleMap(rules)
+      if (Object.keys(normalized).length) result[sessionId] = normalized
+    }
+    return result
+  }
+
+  function normalizeOverrides(raw) {
+    return {
+      enabled: raw?.enabled === true,
+      // sections / contexts 是全局基线，只在会话启动时读一次（见 freezeBaseline）。
+      sections: normalizeRuleMap(raw?.sections),
+      contexts: normalizeRuleMap(raw?.contexts),
+      // session* 是会话页的即时规则，每次装配都重新读，且只影响那一个会话。
+      sessionSections: normalizeSessionRules(raw?.sessionSections),
+      sessionContexts: normalizeSessionRules(raw?.sessionContexts),
+      saved: normalizeSavedOverrides(raw?.saved),
+    }
+  }
+
+  /** 把一条 replace 规则的文本归档，供之后重新应用。 */
+  function appendSaved(overrides, layer, name, rule, sessionId) {
+    const saved = [...(overrides?.saved ?? [])]
+    const text = typeof rule?.text === 'string' ? rule.text : ''
+    if (rule?.mode !== 'replace' || !text.trim()) return saved
+    const entry = {
+      id: `saved-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+      name,
+      layer,
+      text,
+      createdAt: nowIso(),
+    }
+    if (sessionId) entry.sessionId = String(sessionId)
+    saved.unshift(entry)
+    return saved.slice(0, 100)
+  }
+
+  // -------------------------------------------------------------- store i/o
+
+  async function loadStore() {
+    try {
+      const text = await readFile(storeFile, 'utf8')
+      const parsed = text.trim() ? JSON.parse(text) : null
+      const legacy = !parsed || Number(parsed?.version ?? 1) < STORE_VERSION
+      const document = normalizeDocument(parsed)
+      state.document = document
+      if (legacy) {
+        try {
+          await writeFile(storeFile, `${JSON.stringify(document, null, 2)}\n`, 'utf8')
+          diag('migrated-to-v2')
+        } catch (error) {
+          diag(`migrate-write-failed ${error?.message ?? error}`)
+        }
+      }
+      return document
+    } catch (error) {
+      if (error?.code === 'ENOENT') {
+        state.document = emptyDocument()
+        return state.document
+      }
+      log(`load-failed ${error?.message ?? error}`)
+      return state.document
+    }
+  }
+
+  async function saveStore(document) {
+    const normalized = normalizeDocument(document)
+    await writeFile(storeFile, `${JSON.stringify(normalized, null, 2)}\n`, 'utf8')
+    state.document = normalized
+    return normalized
+  }
+
+  // ------------------------------------------------------------- resolution
+
+  function workspaceEntries() {
+    return Object.entries(state.document.applications.workspaces)
+  }
+
+  function matchWorkspaceKey(cwd) {
+    const current = normalizePathValue(cwd)
+    if (!current) return ''
+    let best = ''
+    for (const [key] of workspaceEntries()) {
+      if (!key) continue
+      if (current === key || current.startsWith(`${key}/`)) {
+        if (key.length > best.length) best = key
+      }
+    }
+    return best
+  }
+
+  function layerItem(entry, source) {
+    return {
+      source,
+      id: entry.id,
+      title: entry.title,
+      text: entry.text,
+      order: entry.order,
+      agentScope: normalizeAgentScope(entry.agentScope),
+    }
+  }
+
+  /**
+   * 子代理判定：框架在 SessionHeader 里已经标好了，不需要自己推断。
+   * 优先看 origin，其次 parentSession，最后看委派深度。
+   */
+  function agentFacts(agent) {
+    try {
+      const header = agent?.session?.header
+      const parentSessionId = typeof header?.parentSession === 'string' ? header.parentSession : ''
+      const subagent = header?.origin === 'subagent'
+        || Boolean(parentSessionId)
+        || Number(header?.delegationDepth ?? 0) > 0
+      return { subagent, parentSessionId }
+    } catch {
+      return { subagent: false, parentSessionId: '' }
+    }
+  }
+
+  /** agentScope 过滤：inherit 总是注入，main 只给主代理，subagent 只给子代理。 */
+  function allowForScope(item, facts) {
+    const scope = normalizeAgentScope(item?.agentScope)
+    if (scope === 'inherit') return true
+    const isSubagent = facts?.subagent === true
+    return scope === 'subagent' ? isSubagent : !isSubagent
+  }
+
+  /**
+   * 冻结一个会话的全局规则基线。
+   *
+   * 主页改的是全局规则，它只影响之后新建的会话：提示词前缀一变，服务端缓存就整段失效，
+   * 所以不让它追杀正在跑的会话。会话页改的是 sessionSections / sessionContexts，
+   * 那些不冻结，每次装配实时读取 —— 用户明确要求"即时生效、会话间隔离"。
+   * 总开关也不冻结：它是全局刹车，必须立刻有效。
+   */
+  function freezeBaseline(sessionId) {
+    if (!sessionId || sessionBaselines.has(sessionId)) return
+    const overrides = state.document.overrides ?? {}
+    sessionBaselines.set(sessionId, {
+      sections: { ...(overrides.sections ?? {}) },
+      contexts: { ...(overrides.contexts ?? {}) },
+    })
+  }
+
+  /**
+   * 静态层：全局应用 + 未开启后注入的工作区应用。
+   * 会话创建时注册一次，之后不再变化 —— 对应"系统提示词不需要后注入"。
+   */
+  function resolveStaticItems(facts) {
+    const document = state.document
+    const workspaceKey = matchWorkspaceKey(facts?.cwd)
+    const workspace = workspaceKey ? document.applications.workspaces[workspaceKey] : undefined
+    const disabled = new Set(workspace?.disabled ?? [])
+    const hot = workspace?.hotReload === true
+    const globalEnabled = new Set(document.applications.global.enabled)
+    const items = []
+    for (const entry of document.entries) {
+      if (!allowForScope(entry, facts)) continue
+      if (disabled.has(entry.id)) continue
+      const inWorkspace = workspace
+        ? workspace.enabled.includes(entry.id) || workspace.default.includes(entry.id)
+        : false
+      // 开了后注入的工作区，其条目一律交给动态层，避免同一段落被两条路径各注入一次。
+      if (inWorkspace && hot) continue
+      if (globalEnabled.has(entry.id) || inWorkspace) items.push(layerItem(entry, 'library'))
+    }
+    return items.sort((left, right) => left.order - right.order)
+  }
+
+  /**
+   * 后注入层：会话临时条目（必须每轮生效）+ 开启了后注入的工作区条目。
+   * 每次 system-prompt/assemble 都重新解析，所以改完下一轮立即生效。
+   */
+  function resolveDynamicItems(facts) {
+    const document = state.document
+    const workspaceKey = matchWorkspaceKey(facts?.cwd)
+    const workspace = workspaceKey ? document.applications.workspaces[workspaceKey] : undefined
+    const disabled = new Set(workspace?.disabled ?? [])
+    const items = []
+    if (workspace?.hotReload === true) {
+      for (const entry of document.entries) {
+        if (!allowForScope(entry, facts)) continue
+        if (disabled.has(entry.id)) continue
+        if (!workspace.enabled.includes(entry.id) && !workspace.default.includes(entry.id)) continue
+        items.push(layerItem(entry, 'library'))
+      }
+    }
+    for (const temporary of document.temporary) {
+      if (!allowForScope(temporary, facts)) continue
+      if (temporary.sessionId && (!facts?.sessionId || temporary.sessionId !== facts.sessionId)) continue
+      items.push({
+        source: 'temporary',
+        id: temporary.id,
+        title: temporary.title,
+        text: temporary.text,
+        order: temporary.order,
+        agentScope: normalizeAgentScope(temporary.agentScope),
+      })
+    }
+    return items.sort((left, right) => left.order - right.order)
+  }
+
+  /** 预览 / 排查用：静态层 + 后注入层合并，按 section name 去重，并标注注入方式。 */
+  function resolveItems(facts) {
+    const seen = new Set()
+    const merged = []
+    const push = (items, injection) => {
+      for (const item of items) {
+        const name = sectionName(item.id, item.source)
+        if (seen.has(name)) continue
+        seen.add(name)
+        merged.push({ ...item, injection })
+      }
+    }
+    push(resolveStaticItems(facts), 'static')
+    push(resolveDynamicItems(facts), 'hot')
+    return merged.sort((left, right) => left.order - right.order)
+  }
+
+  // ----------------------------------------------------------- agent wiring
+
+  function sessionIdOf(agent) {
+    try {
+      const value = agent?.session?.id ?? agent?.sessionId
+      return typeof value === 'string' && value.trim() ? value.trim() : ''
+    } catch {
+      return ''
+    }
+  }
+
+  function workingDirectoryOf(agent) {
+    try {
+      const value = ctx.get('workingDirectory')?.get?.(agent?.session)
+      return typeof value === 'string' ? value : ''
+    } catch {
+      return ''
+    }
+  }
+
+  function cleanupAgentSections(agent) {
+    const key = sessionIdOf(agent)
+    if (!key) return
+    const cleanups = agentCleanups.get(key)
+    if (!cleanups) return
+    for (const dispose of cleanups) {
+      try {
+        dispose()
+      } catch {
+        /* best effort */
+      }
+    }
+    agentCleanups.delete(key)
+  }
+
+  function syncAgentSections(agent) {
+    if (!agent?.ctx?.systemPrompt?.section) return
+    const sessionId = sessionIdOf(agent)
+    const facts = { sessionId, cwd: workingDirectoryOf(agent), ...agentFacts(agent) }
+    if (sessionId) {
+      sessionFacts.set(sessionId, facts)
+      freezeBaseline(sessionId)
+    }
+    cleanupAgentSections(agent)
+    // 静态层：全局 + 未开启后注入的工作区条目。动态层交给 assemble waterfall。
+    const items = resolveStaticItems(facts)
+    const cleanups = []
+    for (const item of items) {
+      try {
+        cleanups.push(agent.ctx.systemPrompt.section({
+          name: sectionName(item.id, item.source),
+          order: item.order,
+          text: item.text,
+        }))
+      } catch (error) {
+        log(`register-failed ${item.id}: ${error?.message ?? error}`)
+      }
+    }
+    if (sessionId) agentCleanups.set(sessionId, cleanups)
+    diag(`agent-sections sid=${sessionId || '-'} cwd=${facts.cwd || '-'} items=${items.length}`)
+  }
+
+  const assembleHookAgents = new WeakSet()
+
+  /**
+   * 静态 section 只在注册那一刻进入装配结果：对已经在运行的 agent，之后再
+   * 追加的条目不会进入它的系统提示。system-prompt/assemble 是每次装配都会
+   * 调用的 waterfall，且按 scope 分发，挂在 agent ctx 上就只在该 agent 装配
+   * 时触发 —— 这是会话临时条目与"开启了后注入"的工作区条目的注入点。
+   * 只注入动态层，并与静态注册按 name 去重，避免同一段落出现两次。
+   */
+  /** 记录最近一次真实装配，供面板枚举 agent 作用域的内容。 */
+  function recordSnapshot(sessionId, snapshot) {
+    try {
+      const key = sessionId || '-'
+      const previous = assemblySnapshots.get(key)
+      assemblySnapshots.set(key, {
+        at: Date.now(),
+        revision: (previous?.revision ?? 0) + 1,
+        sections: snapshot?.sections ?? [],
+        contexts: snapshot?.contexts ?? [],
+        tools: snapshot?.tools ?? [],
+        injected: snapshot?.injected ?? [],
+      })
+      if (assemblySnapshots.size > 20) {
+        const oldest = [...assemblySnapshots.entries()].sort((a, b) => (a[1].at ?? 0) - (b[1].at ?? 0))[0]
+        if (oldest) assemblySnapshots.delete(oldest[0])
+      }
+    } catch (error) {
+      diag(`snapshot-failed ${error?.message ?? error}`)
+    }
+  }
+
+  function attachAssembleHook(agent) {
+    if (!agent?.ctx?.on || assembleHookAgents.has(agent)) return
+    assembleHookAgents.add(agent)
+    const sessionId = sessionIdOf(agent)
+    const facts = { sessionId, cwd: workingDirectoryOf(agent), ...agentFacts(agent) }
+    if (sessionId) {
+      sessionFacts.set(sessionId, facts)
+      freezeBaseline(sessionId)
+    }
+    try {
+      agent.ctx.on('system-prompt/assemble', (assembly) => {
+        try {
+          const overrides = state.document.overrides
+          // 总开关不冻结：它是全局刹车，要立刻有效。
+          const active = overrides?.enabled === true
+          // 全局规则取会话启动时的基线（主页改动只对新会话生效）；
+          // 会话级规则实时读取（会话页改动立刻生效，且只影响本会话）。
+          const baseline = sessionBaselines.get(sessionId) ?? {
+            sections: overrides?.sections ?? {},
+            contexts: overrides?.contexts ?? {},
+          }
+          const sessionSectionRules = active && sessionId ? (overrides.sessionSections?.[sessionId] ?? {}) : {}
+          const sessionContextRules = active && sessionId ? (overrides.sessionContexts?.[sessionId] ?? {}) : {}
+          const sectionRules = active ? { ...baseline.sections, ...sessionSectionRules } : {}
+          const contextRules = active ? { ...baseline.contexts, ...sessionContextRules } : {}
+          const items = resolveDynamicItems(facts)
+          const hasRules = Object.keys(sectionRules).length > 0 || Object.keys(contextRules).length > 0
+
+          // 先留一份规则应用之前的原始装配：面板必须能看到被禁用的条目，
+          // 否则一旦禁用就没有入口把它重新打开。
+          const toEntry = (entry) => ({
+            name: String(entry?.name ?? ''),
+            text: typeof entry?.text === 'string' ? entry.text : String(entry?.text ?? ''),
+          })
+          const rawSections = (Array.isArray(assembly?.sections) ? assembly.sections : []).map(toEntry)
+          const rawContexts = (Array.isArray(assembly?.contexts) ? assembly.contexts : []).map(toEntry)
+          const rawTools = (assembly?.tools ?? []).map((tool) => ({
+            name: String(tool?.name ?? ''),
+            description: String(tool?.description ?? ''),
+            parameterKeys: Object.keys(tool?.parameters?.properties ?? {}),
+          }))
+
+          if (!hasRules && !items.length) {
+            recordSnapshot(sessionId, { sections: rawSections, contexts: rawContexts, tools: rawTools, injected: [] })
+            return assembly
+          }
+
+          // 1) 内置段落：disable 直接移除，replace 换文本。
+          const sections = []
+          for (const section of Array.isArray(assembly?.sections) ? assembly.sections : []) {
+            const rule = sectionRules[section?.name]
+            if (rule?.mode === 'disable') continue
+            if (rule?.mode === 'replace') {
+              sections.push({ ...section, text: rule.text })
+              continue
+            }
+            sections.push(section)
+          }
+
+          // 2) contexts 同样处理；required 的 context 若被移除，由框架决定是否恢复。
+          const contexts = []
+          for (const context of Array.isArray(assembly?.contexts) ? assembly.contexts : []) {
+            const rule = contextRules[context?.name]
+            if (rule?.mode === 'disable') continue
+            if (rule?.mode === 'replace') {
+              contexts.push({ ...context, text: rule.text })
+              continue
+            }
+            contexts.push(context)
+          }
+
+          // 3) 再追加动态层；已被 disable 的段落不再追加回来。
+          const existing = new Set(sections.map((section) => section?.name))
+          const allExtras = []
+          for (const item of items) {
+            const name = sectionName(item.id, item.source)
+            if (existing.has(name)) continue
+            allExtras.push({ name, text: item.text })
+          }
+          // 被禁用的动态条目仍要记进快照，否则面板上没有入口把它打开。
+          const extras = allExtras.filter((entry) => sectionRules[entry.name]?.mode !== 'disable')
+
+          recordSnapshot(sessionId, {
+            sections: rawSections,
+            contexts: rawContexts,
+            tools: rawTools,
+            injected: allExtras,
+          })
+          return { ...assembly, sections: [...sections, ...extras], contexts }
+        } catch (error) {
+          log(`assemble-hook-failed ${error?.message ?? error}`)
+          return assembly
+        }
+      })
+      diag(`assemble-hook-attached sid=${sessionId || '-'}`)
+    } catch (error) {
+      diag(`assemble-hook-attach-failed ${error?.message ?? error}`)
+    }
+  }
+
+  /** 档案/应用变更后，对仍在运行的会话重新解析。 */
+  function refreshRunningAgents() {
+    for (const [sessionId, agent] of [...runningAgents.entries()]) {
+      if (!agent) {
+        runningAgents.delete(sessionId)
+        continue
+      }
+      try {
+        syncAgentSections(agent)
+      } catch (error) {
+        log(`refresh-failed ${sessionId}: ${error?.message ?? error}`)
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------- watcher
+
+  function startWatcher() {
+    try {
+      watcher = watch(storeFile, { persistent: false }, () => {
+        if (reloadTimer) clearTimeout(reloadTimer)
+        reloadTimer = setTimeout(() => {
+          reloadTimer = null
+          loadStore()
+            .then(() => {
+              refreshRunningAgents()
+              diag(`store-reloaded entries=${state.document.entries.length}`)
+            })
+            .catch((error) => log(`watch-reload-failed ${error?.message ?? error}`))
+        }, 150)
+      })
+      watcher.on?.('error', () => {})
+    } catch (error) {
+      watcher = null
+      diag(`watcher-create-failed ${error?.message ?? error}`)
+    }
+  }
+
+  // ------------------------------------------------------------------- tool
+
+  function summary() {
+    const document = state.document
+    return `${document.entries.length} 个档案条目，全局启用 ${document.applications.global.enabled.length} 个，` +
+      `${Object.keys(document.applications.workspaces).length} 个工作区有应用配置，${document.temporary.length} 条临时条目`
+  }
+
+  const toolDefinition = {
+    name: 'prompt_manager',
+    description:
+      'Manage the prompt library stored in $DSH_HOME/prompt-manager.json. ' +
+      'The model is library / application / temporary: "library" holds long-lived prompt entries ' +
+      '(id, title, text, order); "application" binds entries to the global scope or to one workspace ' +
+      'directory via enabled / disabled / default sets; "temporary" entries bind to a session id and ' +
+      'never enter the library. Injection is layered: global entries are registered statically when a ' +
+      'session is created; session temporary entries are hot-injected on every assembly; a workspace ' +
+      'becomes hot-injected too when apply.hotReload is on for it. ' +
+      'Built-in sections (Harness and other plugins) can be turned off or replaced via ' +
+      'override.set / override.clear / override.toggle; overrides only apply while the master switch is on. ' +
+      'Actions: list, preview, library.add, library.update, library.remove, ' +
+      'apply.toggle, apply.default, apply.hotReload, override.set, override.clear, override.toggle, ' +
+      'override.reset, override.restore, override.forget, ' +
+      'temp.add, temp.remove, reload, path.',
+    // register() takes an already-compiled raw JSON Schema.
+    parameters: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          description:
+            'list | preview | library.add | library.update | library.remove | apply.toggle | apply.default | apply.hotReload | override.set | override.clear | override.toggle | override.reset | override.restore | override.forget | temp.add | temp.remove | reload | path',
+        },
+        id: { type: 'string', description: 'Entry id for library/temp entries, or saved-override id for override.restore / override.forget' },
+        title: { type: 'string', description: 'Human-readable title' },
+        text: { type: 'string', description: 'Prompt text inserted verbatim; for override.set with mode=replace it is the replacement text' },
+        order: { type: 'number', description: 'Prompt section order (default 9000; persona suffix is 10200)' },
+        scope: { type: 'string', description: 'For apply.toggle: global | workspace (default global)' },
+        workspacePath: { type: 'string', description: 'Workspace directory for scope=workspace or apply.default' },
+        enabled: { type: 'boolean', description: 'For apply.toggle, apply.hotReload, override.toggle: true enables, false disables' },
+        isDefault: { type: 'boolean', description: 'For apply.default: mark or unmark as a workspace default entry' },
+        sessionId: { type: 'string', description: 'Session id: temp.add / preview, or per-session context overrides (override.set / override.clear / override.reset)' },
+        name: { type: 'string', description: 'For override.set / override.clear: exact section or context name, e.g. harness:identity' },
+        mode: { type: 'string', description: 'For override.set: disable | replace' },
+        layer: { type: 'string', description: 'For override.set / override.clear: section | context (default section)' },
+        agentScope: {
+          type: 'string',
+          description:
+            "Target agent kind for library.add / library.update / temp.add: 'inherit' (default, both kinds), " +
+            "'main' (main agents only), or 'subagent' (subagents only). Subagent status comes from SessionHeader.",
+        },
+      },
+      required: ['action'],
+    },
+    output: {
+      schema: { type: 'string' },
+      render: (_args, value) => [{ type: 'text', text: String(value) }],
+    },
+    async execute(args) {
+      const action = String(args?.action ?? 'list').toLowerCase()
+
+      if (action === 'path') {
+        return `${storeFile}\n(${summary()})`
+      }
+      if (action === 'reload') {
+        await loadStore()
+        refreshRunningAgents()
+        return `已重新载入：${summary()}`
+      }
+      if (action === 'list') {
+        const document = state.document
+        const lines = [summary()]
+        const scopeLabel = (value) =>
+            value === 'main' ? '仅主代理' : value === 'subagent' ? '仅子代理' : ''
+          for (const entry of document.entries) {
+            const glob = document.applications.global.enabled.includes(entry.id) ? '全局启用' : '未全局启用'
+            const scope = scopeLabel(entry.agentScope)
+            const spaces = Object.entries(document.applications.workspaces)
+              .filter(([, config]) => config.enabled.includes(entry.id))
+              .map(([key]) => key)
+            lines.push(`- ${entry.id} | ${entry.title} | order ${entry.order} | ${glob}${scope ? ` | ${scope}` : ''}${spaces.length ? ` | 工作区: ${spaces.join(', ')}` : ''}`)
+          }
+          for (const temporary of document.temporary) {
+            const scope = scopeLabel(temporary.agentScope)
+            lines.push(`- [临时] ${temporary.id} | ${temporary.title} | session ${temporary.sessionId || '(任意)'}${scope ? ` | ${scope}` : ''}`)
+          }
+        return lines.join('\n')
+      }
+      if (action === 'preview') {
+        const sessionId = typeof args?.sessionId === 'string' ? args.sessionId.trim() : ''
+        const facts = sessionId ? sessionFacts.get(sessionId) ?? { sessionId, cwd: '' } : { sessionId: '', cwd: '' }
+        const items = resolveItems(facts)
+        return [
+          `cwd=${facts.cwd || '(未知)'} session=${facts.sessionId || '(未指定)'} [${facts.subagent ? '子代理' : '主代理'}] → ${items.length} 段`,
+          ...items.map((item) => `--- ${item.source}:${item.id} (order ${item.order}${item.agentScope !== 'inherit' ? `, ${item.agentScope}` : ''}) ---\n${item.text}`),
+        ].join('\n\n')
+      }
+      if (action === 'library.add' || action === 'library.update') {
+        const document = state.document
+        const id = typeof args?.id === 'string' ? args.id.trim() : ''
+        if (!id) return 'error: id 不能为空'
+        const existing = document.entries.find((entry) => entry.id === id)
+        if (action === 'library.add' && existing) return `error: 档案已存在 ${id}`
+        if (action === 'library.update' && !existing) return `error: 档案不存在 ${id}`
+        const normalized = normalizeEntry({
+          id,
+          title: args?.title ?? existing?.title ?? id,
+          text: args?.text ?? existing?.text ?? '',
+          order: args?.order ?? existing?.order ?? DEFAULT_ORDER,
+          agentScope: args?.agentScope ?? existing?.agentScope ?? 'inherit',
+        })
+        if (!normalized) return 'error: text 不能为空'
+        const entries = document.entries.filter((entry) => entry.id !== id)
+        entries.push(normalized)
+        await saveStore({ ...document, entries })
+        refreshRunningAgents()
+        return `${action === 'library.add' ? '已创建' : '已更新'}档案 ${id}`
+      }
+      if (action === 'library.remove') {
+        const document = state.document
+        const id = typeof args?.id === 'string' ? args.id.trim() : ''
+        if (!id || !document.entries.some((entry) => entry.id === id)) return `error: 档案不存在 ${id}`
+        const applications = {
+          global: { enabled: document.applications.global.enabled.filter((value) => value !== id) },
+          workspaces: {},
+        }
+        for (const [key, value] of workspaceEntries()) {
+          const next = {
+            enabled: value.enabled.filter((item) => item !== id),
+            disabled: value.disabled.filter((item) => item !== id),
+            default: value.default.filter((item) => item !== id),
+          }
+          if (next.enabled.length || next.disabled.length || next.default.length) {
+            applications.workspaces[key] = next
+          }
+        }
+        await saveStore({
+          ...document,
+          entries: document.entries.filter((entry) => entry.id !== id),
+          applications,
+        })
+        refreshRunningAgents()
+        return `已删除档案 ${id}（并清理其全部应用关系）`
+      }
+      if (action === 'apply.toggle') {
+        const document = state.document
+        const id = typeof args?.id === 'string' ? args.id.trim() : ''
+        if (!id || !document.entries.some((entry) => entry.id === id)) return `error: 档案不存在 ${id}`
+        const enabled = args?.enabled !== false
+        if ((args?.scope ?? 'global') !== 'workspace') {
+          const list = document.applications.global.enabled.filter((value) => value !== id)
+          if (enabled) list.push(id)
+          await saveStore({
+            ...document,
+            applications: { ...document.applications, global: { enabled: list } },
+          })
+          refreshRunningAgents()
+          return `全局${enabled ? '启用' : '禁用'} ${id}`
+        }
+        const key = normalizePathValue(args?.workspacePath)
+        if (!key) return 'error: scope=workspace 需要 workspacePath'
+        const workspaces = { ...document.applications.workspaces }
+        const target = workspaces[key] ?? { enabled: [], disabled: [], default: [] }
+        target.enabled = target.enabled.filter((value) => value !== id)
+        target.disabled = target.disabled.filter((value) => value !== id)
+        if (enabled) target.enabled.push(id)
+        else target.disabled.push(id)
+        if (!enabled) target.default = target.default.filter((value) => value !== id)
+        workspaces[key] = target
+        await saveStore({ ...document, applications: { ...document.applications, workspaces } })
+        refreshRunningAgents()
+        return `工作区 ${key} ${enabled ? '启用' : '禁用'} ${id}`
+      }
+      if (action === 'apply.default') {
+        const document = state.document
+        const id = typeof args?.id === 'string' ? args.id.trim() : ''
+        const key = normalizePathValue(args?.workspacePath)
+        if (!id || !document.entries.some((entry) => entry.id === id)) return `error: 档案不存在 ${id}`
+        if (!key) return 'error: apply.default 需要 workspacePath'
+        const workspaces = { ...document.applications.workspaces }
+        const target = workspaces[key] ?? { enabled: [], disabled: [], default: [] }
+        if (args?.isDefault === false) {
+          target.default = target.default.filter((value) => value !== id)
+        } else {
+          if (!target.enabled.includes(id)) target.enabled.push(id)
+          target.disabled = target.disabled.filter((value) => value !== id)
+          if (!target.default.includes(id)) target.default.push(id)
+        }
+        workspaces[key] = target
+        await saveStore({ ...document, applications: { ...document.applications, workspaces } })
+        refreshRunningAgents()
+        return `${key} 的默认条目${args?.isDefault === false ? '取消' : '设为'} ${id}`
+      }
+      if (action === 'apply.hotReload') {
+        const document = state.document
+        const key = normalizePathValue(args?.workspacePath)
+        if (!key) return 'error: apply.hotReload 需要 workspacePath'
+        const workspaces = { ...document.applications.workspaces }
+        const target = workspaces[key] ?? { enabled: [], disabled: [], default: [], hotReload: false }
+        target.hotReload = args?.enabled !== false
+        workspaces[key] = target
+        await saveStore({ ...document, applications: { ...document.applications, workspaces } })
+        refreshRunningAgents()
+        return `${key} 后注入${target.hotReload ? '已开启' : '已关闭'}`
+      }
+      if (action === 'override.set') {
+        const document = state.document
+        const name = typeof args?.name === 'string' ? args.name.trim() : ''
+        if (!name) return 'error: override.set 需要 name'
+        const layer = args?.layer === 'context' ? 'contexts' : 'sections'
+        const mode = args?.mode === 'disable' ? 'disable'
+          : args?.mode === 'replace' ? 'replace'
+            : args?.mode === 'enable' ? 'enable'
+              : ''
+        if (!mode) return 'error: mode 必须是 disable / replace / enable'
+        const current = document.overrides ?? {
+          enabled: false,
+          sections: {},
+          contexts: {},
+          sessionSections: {},
+          sessionContexts: {},
+          saved: [],
+        }
+
+        let rule = { mode }
+        if (mode === 'replace') {
+          const text = typeof args?.text === 'string' ? args.text : ''
+          if (!text.trim()) return 'error: replace 模式需要非空 text'
+          rule = { mode, text }
+        }
+        const verb = mode === 'disable' ? '禁用' : mode === 'enable' ? '恢复原文' : '覆盖'
+
+        // 带 sessionId 只影响那个会话（立即生效）；不带则写全局基线（新建会话生效）。
+        const label = layer === 'contexts' ? 'context' : 'section'
+        const targetSession = typeof args?.sessionId === 'string' ? args.sessionId.trim() : ''
+        if (targetSession) {
+          const bucketKey = layer === 'contexts' ? 'sessionContexts' : 'sessionSections'
+          const bucket = { ...(current[bucketKey] ?? {}) }
+          const sessionRules = { ...(bucket[targetSession] ?? {}) }
+          sessionRules[name] = rule
+          bucket[targetSession] = sessionRules
+          await saveStore({ ...document, overrides: { ...current, enabled: true, [bucketKey]: bucket } })
+          refreshRunningAgents()
+          return `${label} ${name} 已${verb}（仅会话 ${targetSession}，立即生效）`
+        }
+
+        const rules = { ...(current[layer] ?? {}) }
+        rules[name] = rule
+        await saveStore({
+          ...document,
+          // 点开关即视为要用改写，顺手把总开关打开；总开关只用来一键全停。
+          overrides: { ...current, enabled: true, [layer]: rules },
+        })
+        refreshRunningAgents()
+        return `${label} ${name} 已${verb}（全局，新建会话生效；运行中的会话可在会话页单独调整）`
+      }
+      if (action === 'override.clear') {
+        const document = state.document
+        const name = typeof args?.name === 'string' ? args.name.trim() : ''
+        if (!name) return 'error: override.clear 需要 name'
+        const layer = args?.layer === 'context' ? 'contexts' : 'sections'
+        const current = document.overrides ?? {
+          enabled: false,
+          sections: {},
+          contexts: {},
+          sessionSections: {},
+          sessionContexts: {},
+          saved: [],
+        }
+        const targetSession = typeof args?.sessionId === 'string' ? args.sessionId.trim() : ''
+        const label = layer === 'contexts' ? 'context' : 'section'
+
+        if (targetSession) {
+          const bucketKey = layer === 'contexts' ? 'sessionContexts' : 'sessionSections'
+          const bucket = { ...(current[bucketKey] ?? {}) }
+          const sessionRules = { ...(bucket[targetSession] ?? {}) }
+          if (!sessionRules[name]) return `error: 会话 ${targetSession} 没有条目 ${name} 的改写记录`
+          const rule = sessionRules[name]
+          delete sessionRules[name]
+          if (Object.keys(sessionRules).length) bucket[targetSession] = sessionRules
+          else delete bucket[targetSession]
+          const saved = appendSaved(current, layer, name, rule, targetSession)
+          await saveStore({ ...document, overrides: { ...current, [bucketKey]: bucket, saved } })
+          refreshRunningAgents()
+          return `${label} ${name} 已在会话 ${targetSession} 恢复默认`
+        }
+
+        const rules = { ...(current[layer] ?? {}) }
+        if (!rules[name]) return `error: 没有条目 ${name} 的改写记录`
+        const rule = rules[name]
+        delete rules[name]
+        // 恢复默认时把覆盖文本归档，之后还能再应用回来。
+        const saved = appendSaved(current, layer, name, rule)
+        await saveStore({ ...document, overrides: { ...current, [layer]: rules, saved } })
+        refreshRunningAgents()
+        return `${label} ${name} 已恢复默认（全局，新建会话生效）`
+      }
+      if (action === 'override.toggle') {
+        const document = state.document
+        const enabled = args?.enabled !== false
+        const current = document.overrides ?? { enabled: false, sections: {}, contexts: {}, saved: [] }
+        await saveStore({ ...document, overrides: { ...current, enabled } })
+        refreshRunningAgents()
+        return `内置提示词改写总开关${enabled ? '已开启' : '已关闭'}`
+      }
+      if (action === 'override.reset') {
+        const document = state.document
+        const current = document.overrides ?? {
+          enabled: false,
+          sections: {},
+          contexts: {},
+          sessionSections: {},
+          sessionContexts: {},
+          saved: [],
+        }
+        const targetSession = typeof args?.sessionId === 'string' ? args.sessionId.trim() : ''
+
+        // 带 sessionId：只清那个会话的 sections + contexts 规则，立即生效。
+        if (targetSession) {
+          const next = { ...current }
+          let saved = [...(current.saved ?? [])]
+          let count = 0
+          for (const [bucketKey, layer] of [['sessionSections', 'sections'], ['sessionContexts', 'contexts']]) {
+            const bucket = { ...(current[bucketKey] ?? {}) }
+            for (const [name, rule] of Object.entries(bucket[targetSession] ?? {})) {
+              saved = appendSaved({ saved }, layer, name, rule, targetSession)
+              count += 1
+            }
+            delete bucket[targetSession]
+            next[bucketKey] = bucket
+          }
+          await saveStore({ ...document, overrides: { ...next, saved: saved.slice(0, 100) } })
+          refreshRunningAgents()
+          return `已恢复会话 ${targetSession} 的 ${count} 条规则（立即生效，覆盖文本已归档）`
+        }
+
+        let saved = [...(current.saved ?? [])]
+        let count = 0
+        for (const layer of ['sections', 'contexts']) {
+          for (const [name, rule] of Object.entries(current[layer] ?? {})) {
+            saved = appendSaved({ saved }, layer, name, rule)
+            count += 1
+          }
+        }
+        for (const [bucketKey, layer] of [['sessionSections', 'sections'], ['sessionContexts', 'contexts']]) {
+          for (const [sessionId, rules] of Object.entries(current[bucketKey] ?? {})) {
+            for (const [name, rule] of Object.entries(rules ?? {})) {
+              saved = appendSaved({ saved }, layer, name, rule, sessionId)
+              count += 1
+            }
+          }
+        }
+        await saveStore({
+          ...document,
+          overrides: {
+            enabled: false,
+            sections: {},
+            contexts: {},
+            sessionSections: {},
+            sessionContexts: {},
+            saved: saved.slice(0, 100),
+          },
+        })
+        refreshRunningAgents()
+        return `已恢复全部内置提示词，清除 ${count} 项规则（覆盖文本已归档 ${saved.length} 条）`
+      }
+      if (action === 'override.restore') {
+        const document = state.document
+        const id = typeof args?.id === 'string' ? args.id.trim() : ''
+        if (!id) return 'error: override.restore 需要 id'
+        const current = document.overrides ?? {
+          enabled: false,
+          sections: {},
+          contexts: {},
+          sessionSections: {},
+          sessionContexts: {},
+          saved: [],
+        }
+        const item = (current.saved ?? []).find((entry) => entry.id === id)
+        if (!item) return `error: 找不到已保存的覆盖 ${id}`
+
+        // 来自某会话的覆盖，装回那个会话，不污染全局。
+        if (item.sessionId) {
+          const bucketKey = item.layer === 'contexts' ? 'sessionContexts' : 'sessionSections'
+          const bucket = { ...(current[bucketKey] ?? {}) }
+          const sessionRules = { ...(bucket[item.sessionId] ?? {}) }
+          sessionRules[item.name] = { mode: 'replace', text: item.text }
+          bucket[item.sessionId] = sessionRules
+          await saveStore({ ...document, overrides: { ...current, enabled: true, [bucketKey]: bucket } })
+          refreshRunningAgents()
+          return `已应用保存的覆盖：${item.name}（仅会话 ${item.sessionId}，立即生效）`
+        }
+
+        const rules = { ...(current[item.layer] ?? {}) }
+        rules[item.name] = { mode: 'replace', text: item.text }
+        await saveStore({ ...document, overrides: { ...current, enabled: true, [item.layer]: rules } })
+        refreshRunningAgents()
+        return `已应用保存的覆盖：${item.name}`
+      }
+      if (action === 'override.forget') {
+        const document = state.document
+        const id = typeof args?.id === 'string' ? args.id.trim() : ''
+        if (!id) return 'error: override.forget 需要 id'
+        const current = document.overrides ?? { enabled: false, sections: {}, contexts: {}, saved: [] }
+        const saved = (current.saved ?? []).filter((entry) => entry.id !== id)
+        if (saved.length === (current.saved ?? []).length) return `error: 找不到已保存的覆盖 ${id}`
+        await saveStore({ ...document, overrides: { ...current, saved } })
+        return `已删除保存的覆盖 ${id}`
+      }
+      if (action === 'temp.add') {
+        const document = state.document
+        const text = typeof args?.text === 'string' ? args.text : ''
+        if (!text.trim()) return 'error: text 不能为空'
+        const temporary = normalizeTemporary({
+          id: typeof args?.id === 'string' && args.id.trim() ? args.id.trim() : `temp-${Date.now().toString(36)}`,
+          sessionId: args?.sessionId,
+          title: args?.title ?? '临时条目',
+          text,
+          order: args?.order,
+          agentScope: args?.agentScope,
+        })
+        if (!temporary) return 'error: 临时条目无效'
+        const rest = document.temporary.filter((item) => item.id !== temporary.id)
+        await saveStore({ ...document, temporary: [...rest, temporary] })
+        refreshRunningAgents()
+        return `已添加临时条目 ${temporary.id}（session=${temporary.sessionId || '任意'}）`
+      }
+      if (action === 'temp.remove') {
+        const document = state.document
+        const id = typeof args?.id === 'string' ? args.id.trim() : ''
+        if (!id) return 'error: id 不能为空'
+        const rest = document.temporary.filter((item) => item.id !== id)
+        if (rest.length === document.temporary.length) return `error: 临时条目不存在 ${id}`
+        await saveStore({ ...document, temporary: rest })
+        refreshRunningAgents()
+        return `已删除临时条目 ${id}`
+      }
+      return `error: 未知 action ${action}`
+    },
+  }
+
+  // ------------------------------------------------------------- http route
+
+  function listWorkspaces() {
+    try {
+      const registry = ctx.get('workspaceRegistry')
+      const list = registry?.list?.() ?? []
+      return list.map((workspace) => ({
+        id: String(workspace?.id ?? ''),
+        title: String(workspace?.title ?? workspace?.id ?? ''),
+        path: String(workspace?.directory ?? workspace?.path ?? ''),
+      }))
+    } catch {
+      return []
+    }
+  }
+
+  function snapshot() {
+    const document = state.document
+    return {
+      ok: true,
+      file: storeFile,
+      summary: summary(),
+      entries: document.entries,
+      applications: document.applications,
+      temporary: document.temporary,
+      workspaces: listWorkspaces(),
+    }
+  }
+
+  try {
+    ctx.webServer.register({
+      kind: 'exact',
+      path: '/prompt-manager/api',
+      handler: async (request, response) => {
+        const send = (status, value) => {
+          response.statusCode = status
+          response.setHeader('content-type', 'application/json; charset=utf-8')
+          response.setHeader('cache-control', 'no-store')
+          response.end(JSON.stringify(value))
+        }
+        try {
+          if (request.method === 'GET') {
+            await loadStore()
+            const url = new URL(request.url || '/', 'http://127.0.0.1')
+            const view = url.searchParams.get('view') ?? ''
+            if (view === 'assembled') {
+              // 真实装配快照：waterfall 每轮触发时记录，因此包含 agent 作用域的
+              // 段落、context 与全部工具，这是 assemble({}) 拿不到的部分。
+              const requested = url.searchParams.get('sessionId') ?? ''
+              const overrides = state.document.overrides ?? { enabled: false, sections: {}, contexts: {} }
+              let key = requested
+              if (!key) {
+                const newest = [...assemblySnapshots.entries()].sort((a, b) => (b[1].at ?? 0) - (a[1].at ?? 0))[0]
+                key = newest?.[0] ?? ''
+              }
+              const snapshot = key ? assemblySnapshots.get(key) : undefined
+              const active = overrides.enabled === true
+              // 全局规则取该会话的基线（主页改动只对新会话生效）；会话级规则实时读取。
+              const baseline = sessionBaselines.get(key) ?? {
+                sections: overrides.sections ?? {},
+                contexts: overrides.contexts ?? {},
+              }
+              const sessionSectionRules = active && key ? (overrides.sessionSections?.[key] ?? {}) : {}
+              const sessionContextRules = active && key ? (overrides.sessionContexts?.[key] ?? {}) : {}
+              const effectiveSectionRules = active ? { ...baseline.sections, ...sessionSectionRules } : {}
+              const effectiveContextRules = active ? { ...baseline.contexts, ...sessionContextRules } : {}
+              const disabledSections = Object.entries(effectiveSectionRules)
+                .filter(([, rule]) => rule?.mode === 'disable')
+                .map(([name]) => name)
+              const disabledContexts = Object.entries(effectiveContextRules)
+                .filter(([, rule]) => rule?.mode === 'disable')
+                .map(([name]) => name)
+              if (!snapshot) {
+                send(200, {
+                  ok: false,
+                  sessionId: key,
+                  reason: '本进程内还没有该会话的装配记录：等目标会话产生一轮回复后再刷新。',
+                  subagent: sessionFacts.get(key)?.subagent === true,
+                  overrides,
+                  sectionRules: effectiveSectionRules,
+                  contextRules: effectiveContextRules,
+                  disabledSections,
+                  disabledContexts,
+                })
+                return
+              }
+              send(200, {
+                ok: true,
+                sessionId: key,
+                subagent: sessionFacts.get(key)?.subagent === true,
+                at: snapshot.at,
+                revision: snapshot.revision,
+                sections: snapshot.sections,
+                contexts: snapshot.contexts,
+                tools: snapshot.tools,
+                injected: snapshot.injected ?? [],
+                overrides,
+                sectionRules: effectiveSectionRules,
+                contextRules: effectiveContextRules,
+                disabledSections,
+                disabledContexts,
+              })
+              return
+            }
+            if (view === 'system') {
+              // 用运行中 agent 的 scoped systemPrompt 装配，才能看到注册在 agent 作用域上的
+              // prompt-manager 段落；用插件根 ctx 装配只会返回宿主/插件段落。
+              const sessionId = url.searchParams.get('sessionId') ?? ''
+              const agent = sessionId ? runningAgents.get(sessionId) : [...runningAgents.values()][0]
+              const target = agent?.ctx?.systemPrompt ?? ctx.systemPrompt
+              let sections = []
+              let contexts = []
+              let tools = []
+              let scope = agent ? 'agent' : 'host'
+              try {
+                const assembly = await target.assemble({})
+                sections = (assembly?.sections ?? []).map((section) => ({
+                  name: String(section?.name ?? ''),
+                  text: typeof section?.text === 'string' ? section.text : String(section?.text ?? ''),
+                }))
+                contexts = (assembly?.contexts ?? []).map((context) => ({
+                  name: String(context?.name ?? ''),
+                  text: typeof context?.text === 'string' ? context.text : String(context?.text ?? ''),
+                }))
+                tools = (assembly?.tools ?? []).map((tool) => ({
+                  name: String(tool?.name ?? ''),
+                  description: String(tool?.description ?? ''),
+                  parameterKeys: Object.keys(tool?.parameters?.properties ?? {}),
+                }))
+              } catch (error) {
+                scope = 'error'
+                diag(`assemble-failed ${error?.stack ?? error}`)
+              }
+              // assemble({}) 不带 scope，不会触发 scoped 的 waterfall 监听器，
+              // 所以这里手工重放一次改写，面板显示的才是运行时真正生效的内容。
+              const overrides = state.document.overrides ?? { enabled: false, sections: {} }
+              const rules = overrides.enabled === true ? (overrides.sections ?? {}) : {}
+              const disabledSections = []
+              const ruled = []
+              for (const section of sections) {
+                const rule = rules[section.name]
+                if (rule?.mode === 'disable') {
+                  disabledSections.push(section.name)
+                  continue
+                }
+                if (rule?.mode === 'replace') {
+                  ruled.push({ ...section, text: rule.text, overridden: true })
+                  continue
+                }
+                ruled.push({ ...section, overridden: false })
+              }
+              sections = ruled
+              const facts = sessionId
+                ? sessionFacts.get(sessionId) ?? { sessionId, cwd: '' }
+                : { sessionId: '', cwd: '' }
+              const injected = resolveItems(facts).map((item) => ({
+                name: sectionName(item.id, item.source),
+                text: item.text,
+                source: item.source,
+                injection: item.injection,
+              }))
+              send(200, {
+                ok: true,
+                deprecated: true,
+                deprecation:
+                  '?view=system 已废弃：assemble({}) 不携带 scope，不会派发给 agent 作用域的 waterfall 监听器，'
+                  + '因此看不到 team:policy、tool:* 等 agent 级段落，结果与真实提示词不一致。请改用 ?view=assembled。',
+                sessionId,
+                scope,
+                sections,
+                contexts,
+                tools,
+                overrides,
+                injected,
+                disabledSections,
+              })
+              return
+            }
+            if (view === 'session') {
+              const sessionId = url.searchParams.get('sessionId') ?? ''
+              const facts = sessionId
+                ? sessionFacts.get(sessionId) ?? { sessionId, cwd: '' }
+                : { sessionId: '', cwd: '' }
+              const items = resolveItems(facts)
+              // 这个会话在本进程内拉起的子代理。
+              const children = []
+              for (const [childId, childFacts] of sessionFacts.entries()) {
+                if (childFacts.parentSessionId && childFacts.parentSessionId === sessionId) {
+                  children.push({
+                    sessionId: childId,
+                    cwd: childFacts.cwd || '',
+                    items: resolveItems(childFacts).map((item) => ({
+                      source: item.source,
+                      id: item.id,
+                      title: item.title,
+                      agentScope: item.agentScope,
+                    })),
+                  })
+                }
+              }
+              send(200, {
+                ok: true,
+                sessionId,
+                cwd: facts.cwd || '',
+                subagent: facts.subagent === true,
+                parentSessionId: facts.parentSessionId || '',
+                matchedWorkspace: matchWorkspaceKey(facts.cwd),
+                items,
+                children,
+                text: items.map((item) => item.text).join('\n\n'),
+              })
+              return
+            }
+            send(200, snapshot())
+            return
+          }
+          if (request.method !== 'POST') {
+            send(405, { ok: false, error: 'method not allowed' })
+            return
+          }
+          let raw = ''
+          for await (const chunk of request) raw += chunk
+          const args = raw ? JSON.parse(raw) : {}
+          const result = await toolDefinition.execute(args)
+          if (String(result).startsWith('error:')) {
+            send(400, { ok: false, error: String(result).slice(6).trim() })
+            return
+          }
+          send(200, { ok: true, message: String(result), ...snapshot() })
+        } catch (error) {
+          diag(`http-handler-failed ${error?.stack ?? error}`)
+          send(500, { ok: false, error: String(error?.message ?? error) })
+        }
+      },
+    })
+    diag('http-route-registered')
+  } catch (error) {
+    diag(`http-route-failed ${error?.stack ?? error}`)
+  }
+
+  // -------------------------------------------------------------- bootstrap
+
+  diag(`apply-enter v2 tools=${typeof ctx.tools} systemPrompt=${typeof ctx.systemPrompt} webServer=${typeof ctx.webServer}`)
+
+  try {
+    ctx.tools.register(toolDefinition)
+    diag('tool-registered')
+  } catch (error) {
+    diag(`tool-register-failed ${error?.stack ?? error}`)
+  }
+
+  loadStore()
+    .then((document) => diag(`initial-load-ok entries=${document.entries.length} temporary=${document.temporary.length}`))
+    .catch((error) => diag(`initial-load-failed ${error?.stack ?? error}`))
+
+  ctx.on('agent/created', (payload) => {
+    try {
+      const agent = payload?.agent
+      const sessionId = sessionIdOf(agent)
+      if (sessionId) runningAgents.set(sessionId, agent)
+      syncAgentSections(agent)
+      attachAssembleHook(agent)
+    } catch (error) {
+      diag(`agent-created-failed ${error?.stack ?? error}`)
+    }
+  })
+
+  ctx.on('agent/disposed', (payload) => {
+    try {
+      const sessionId = sessionIdOf(payload?.agent)
+      if (sessionId) {
+        runningAgents.delete(sessionId)
+        sessionFacts.delete(sessionId)
+      }
+      cleanupAgentSections(payload?.agent)
+    } catch {
+      /* best effort */
+    }
+  })
+
+  try {
+    startWatcher()
+    diag('watcher-started')
+  } catch (error) {
+    diag(`watcher-failed ${error?.stack ?? error}`)
+  }
+
+  diag('apply-ready v2')
+}

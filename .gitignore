@@ -1,0 +1,16 @@
+# 依赖与发布产物
+node_modules/
+dist/
+*.tgz
+
+# 调研产物：asar 解包结果、探针会话、第三方插件调研
+# 里面含本机路径、内网地址与 DSH 安装细节，不进公开仓库
+research/
+
+# 真实提示词装配快照：包含当前环境的系统提示词与会话内容
+docs/snapshots/
+
+# 编辑器与系统
+.DS_Store
+Thumbs.db
+*.log

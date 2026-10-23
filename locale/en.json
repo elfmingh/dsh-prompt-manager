@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Prompt Manager",
+    "description": "Manage prompt sections in three scopes: global (all sessions), session (one session id), and context (sessions matching cwd, preset, or session id). Stored in $DSH_HOME/prompt-manager.json."
+  }
+}

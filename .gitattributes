@@ -1,0 +1,6 @@
+# 统一按 LF 存取，避免 Windows 克隆后整文件伪改动
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.ico binary
