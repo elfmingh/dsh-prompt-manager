@@ -216,6 +216,17 @@ npm run check:client     # 客户端工厂能否被 ModuleLoader 加载
 
 CI 在 Node 22 和 24 上各跑一遍，推 `v*` 标签会自动跑测试、打包并发布 release。
 
+维护脚本：
+
+```powershell
+node scripts/snapshot-sections.mjs http://127.0.0.1:<port> [sessionId]   # 抓一次装配快照
+node scripts/find-in-asar.mjs "要搜的文本" [前后字符数]                    # 在 app.asar 里按字面量搜
+```
+
+前者把 `?view=assembled` 的结果写成 `docs/snapshots/sections-<时间戳>.{json,md}`，用于版本对比。`docs/snapshots/` 和 `research/` 已在 `.gitignore` 中 —— 它们含本机路径与会话内容，不进公开仓库。
+
+发布：在 npm 上认领 `@vertixara` scope，然后 `npm publish`（`publishConfig.access` 已是 `public`，`files` 白名单只含运行时文件）。
+
 ## ⚠️ 已知限制
 
 - 静态注册的条目改不到已经在运行的 agent，只能靠重建会话
@@ -223,6 +234,7 @@ CI 在 Node 22 和 24 上各跑一遍，推 `v*` 标签会自动跑测试、打�
 - `required: true` 的 context 被移除后是否恢复，由框架决定
 - 工具描述只读：改它需要动 `assembly.tools`，风险过高，未开放
 - 面板显示的 tools 数量取决于目标会话是否产生过装配
+- `complete` 段落会在 waterfall 之后被框架还原，对它做改写无效（当前环境未观测到）
 
 ## 📄 License
 
