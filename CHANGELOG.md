@@ -2,6 +2,8 @@
 
 ## 0.2.0 — 2026-10-22
 
+首个公开版本。包名 `@vertixara/dsh-prompt-manager` —— 开发期一直用的 `@local/dsh-prompt-manager` 只是本机占位符，npm 上并不存在；改名同时换了 `cordis.patch.yml` 的插入名和客户端插件 id。
+
 ### 新增
 
 - **真实装配快照**：在 `system-prompt/assemble` waterfall 里记录每轮装配结果，按 sessionId 保存（最多 20 个会话）。这是唯一能拿到 agent 作用域内容的位置，首次可以枚举 `team:policy`、`tool:*` 这类此前完全不可见的段落，以及全部 52 个工具。
