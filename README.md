@@ -264,11 +264,7 @@ node scripts/find-in-asar.mjs "要搜的文本" [前后字符数]               
 
 ## 👤 作者
 
-| 参与者 | 负责 |
-|---|---|
-| **Vertixara** | 需求、设计取舍与验收 |
-| **DeepSeek 4.1 Flash** | 实现、核查、测试与文档 |
-| **GPT 6.1 Sol** | 独立代码审计（[审计报告](docs/audit-2026-10-23.md)）：查出 2 项 P1、8 项 P2 |
+**Vertixara**
 
 - 邮箱：<public@vertixara.com>
 - 仓库：<https://github.com/elfmingh/dsh-prompt-manager>
@@ -276,6 +272,15 @@ node scripts/find-in-asar.mjs "要搜的文本" [前后字符数]               
 - 变更记录：[CHANGELOG.md](CHANGELOG.md)
 
 发现安全问题请直接发邮件，不要开公开 issue。
+
+## 🙏 贡献与致谢
+
+代码与文档由 AI 与 Vertixara 结对完成，审计独立进行。列在这里是为了让后来者知道每部分由谁负责、按什么标准看过：
+
+| 参与者 | 负责 |
+|---|---|
+| **DeepSeek 4.1 Flash** | 实现、核查、测试与文档 |
+| **GPT 6.1 Sol** | 独立代码审计（[审计报告](docs/audit-2026-10-23.md)）：查出 2 项 P1、8 项 P2 |
 
 ## 🤖 关于这份代码
 

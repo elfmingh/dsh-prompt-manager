@@ -6,7 +6,7 @@
 
 - **版权主体明确为 Vertixara**。`LICENSE` 原先写的是占位的 `dsh-prompt-manager contributors`，现在改为 `Copyright (c) 2026 Vertixara`。
 - **补齐 npm 元数据**。`author`、`repository`、`homepage`、`bugs` 此前全部缺失，npm 包页面因此没有作者与仓库信息。
-- **README 增加作者与开发说明**。写明三方分工：Vertixara 负责需求与验收、DeepSeek 4.1 Flash 负责实现与核查、GPT 6.1 Sol 负责独立审计；并标注哪些结论经过真机验证、哪些只有单测覆盖。
+- **README 明确作者与贡献**。作者栏只署 Vertixara —— AI 不作为作者署名；AI 参与情况单列在「贡献与致谢」：DeepSeek 4.1 Flash 负责实现与核查、GPT 6.1 Sol 负责独立审计。同时标注哪些结论经过真机验证、哪些只有单测覆盖。
 - **审计报告标注审计方**。`docs/audit-2026-10-23.md` 头部写明由 GPT 6.1 Sol 独立审查（与实现方不是同一个模型）。
 
 ## 0.2.1 — 2026-10-23
