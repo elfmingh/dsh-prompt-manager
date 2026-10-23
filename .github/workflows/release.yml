@@ -134,15 +134,19 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          for i in $(seq 1 12); do
-            if npm view "$PACKAGE@$version" version >/dev/null 2>&1; then
+          # npm view 会缓存失败结果，且 registry 读侧的 CDN 落后于写入：0.2.4 就是
+          # 在原来那个 60 秒窗口关上之后几十秒才变可见的，导致发布成功却整条流水线
+          # 判定失败、GitHub release 被跳过。改问 registry API，窗口放到 3 分钟。
+          url="https://registry.npmjs.org/$(printf '%s' "$PACKAGE" | sed 's|/|%2f|')/$version"
+          for i in $(seq 1 18); do
+            if curl -fsS "$url" >/dev/null 2>&1; then
               echo "registry 已可见 $PACKAGE@$version"
               exit 0
             fi
-            echo "等待 registry 生效… $i/12"
-            sleep 5
+            echo "等待 registry 生效… $i/18"
+            sleep 10
           done
-          echo "::error::发布命令返回成功，但 60 秒内 registry 仍查不到 $PACKAGE@$version"
+          echo "::error::发布命令返回成功，但 180 秒内 registry 仍查不到 $PACKAGE@$version"
           exit 1
 
       - uses: actions/upload-artifact@v4
