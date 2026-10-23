@@ -1,0 +1,7 @@
+url: https://github.com/elfmingh/dsh-prompt-manager
+name: elfmingh/dsh-prompt-manager
+category: agi
+description:
+  en: 'Layered prompt manager: entries applied globally, per workspace, or per session; built-in system-prompt sections and runtime contexts can be disabled or replaced with a line-level diff; assembly snapshots show what each turn actually received, including subagents.'
+  zh: '分层提示词管理器：条目按全局/工作区/会话三级投放；内置系统提示词段落与运行时上下文可禁用或替换并给出逐行 diff；装配快照显示每轮实际收到的提示词，含子代理。'
+icon: https://raw.githubusercontent.com/elfmingh/dsh-prompt-manager/main/assets/icon.png
