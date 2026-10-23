@@ -267,8 +267,8 @@ node scripts/find-in-asar.mjs "要搜的文本" [前后字符数]               
 | 参与者 | 负责 |
 |---|---|
 | **Vertixara** | 需求、设计取舍与验收 |
-| **DeepSeek** | 实现、核查、测试与文档 |
-| **GPT** | 独立代码审计（[审计报告](docs/audit-2026-10-23.md)）：查出 2 项 P1、8 项 P2 |
+| **DeepSeek 4.1 Flash** | 实现、核查、测试与文档 |
+| **GPT 6.1 Sol** | 独立代码审计（[审计报告](docs/audit-2026-10-23.md)）：查出 2 项 P1、8 项 P2 |
 
 - 邮箱：<public@vertixara.com>
 - 仓库：<https://github.com/elfmingh/dsh-prompt-manager>
@@ -279,7 +279,7 @@ node scripts/find-in-asar.mjs "要搜的文本" [前后字符数]               
 
 ## 🤖 关于这份代码
 
-Host 端、Web 客户端、测试与 CI 绝大多数是由 DeepSeek 与 Vertixara 结对写成的：需求、取舍和验收由 Vertixara 拍板，实现、核查与修复由 DeepSeek 执行，审计由 GPT 独立完成。
+Host 端、Web 客户端、测试与 CI 绝大多数是由 DeepSeek 4.1 Flash 与 Vertixara 结对写成的：需求、取舍和验收由 Vertixara 拍板，实现、核查与修复由 DeepSeek 4.1 Flash 执行，审计由 GPT 6.1 Sol 独立完成。
 
 写下这一点是为了让后来者知道按什么标准读它 —— 哪些结论经过了真机验证、哪些只有单元测试覆盖，都写在下面这段历史里：
 
