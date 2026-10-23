@@ -10,7 +10,7 @@
 // No Harness Client package is imported: controls are drawn with
 // React.createElement and styled only with --dsw-alias-* theme tokens.
 window.__ModuleLoader__.load({
-  id: '@local/dsh-prompt-manager',
+  id: '@vertixara/dsh-prompt-manager',
   factory(require) {
     const React = require('react')
     const h = React.createElement

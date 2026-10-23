@@ -1,5 +1,5 @@
-# Host rows inserted by @local/dsh-prompt-manager.
+# Host rows inserted by @vertixara/dsh-prompt-manager.
 - insert:
     - id: prompt-manager
-      name: '@local/dsh-prompt-manager'
+      name: '@vertixara/dsh-prompt-manager'
       config: {}

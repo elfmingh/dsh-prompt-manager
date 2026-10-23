@@ -11,7 +11,7 @@ DeepSeek Harness 的提示词管理器。管理四类提示词：
 
 前置：DSH `>= 0.2.1-rc.2`，Node `^22.19.0 || >=24.0.0`。没有构建步骤 —— 包里的 `index.js` / `client.js` 就是运行时产物。
 
-**从源码装**（当前形态：包名带 `@local/`，只在本地有意义）：
+**从源码装**（包名 `@vertixara/dsh-prompt-manager`，尚未发布到 npm）：
 
 ```powershell
 dsh plugin --profile web add link:D:\dsh-dev\plugins\dsh-prompt-manager
@@ -23,7 +23,7 @@ dsh web
 **发布到 npm 之后**：
 
 ```powershell
-dsh plugin --profile web add <your-scope>/dsh-prompt-manager
+dsh plugin --profile web add @vertixara/dsh-prompt-manager
 ```
 
 **卸载**：
@@ -32,12 +32,13 @@ dsh plugin --profile web add <your-scope>/dsh-prompt-manager
 dsh plugin --profile web remove dsh-prompt-manager
 ```
 
-### 发布前需要改的
+### 发布前需要做的
 
-包名目前是 `@local/dsh-prompt-manager`（本地 scope，npm 上不存在）。发布前把 `name` 换成自己的 scope，其余元数据已经齐备：
+包名已定为 `@vertixara/dsh-prompt-manager`，元数据齐备，只差在 npm 上认领这个 scope：
 
+- 在 npm 上创建 `@vertixara` 组织（或把包挪到已有 scope 下），然后 `npm login && npm publish`
 - `publishConfig.access: "public"`、`license: MIT`、`keywords` 已设置
-- `engines.node` / `engines.dsh` 声明了支持范围
+- `engines.node` / `engines.dsh` 声明了支持范围，CI 矩阵覆盖 Node 22 与 24
 - `peerDependencies`：`@deepseek-ai/cordis`（必需）、`react`（可选，只有 Web 端用）
 - `files` 白名单只含运行时文件，`research/`、`test/`、`scripts/` 不会进包
 
