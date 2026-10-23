@@ -35,7 +35,7 @@
     }
   },
   "scripts": {
-    "test": "node --test --test-isolation=none \"test/*.test.mjs\"",
+    "test": "node --test --experimental-test-isolation=none \"test/*.test.mjs\"",
     "check:diff": "node test/check-diff.mjs",
     "check:client": "node test/check-client.mjs"
   },

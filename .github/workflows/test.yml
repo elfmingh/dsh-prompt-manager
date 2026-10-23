@@ -1,0 +1,33 @@
+name: Test
+
+# 插件声明支持的 Node 范围都要真的跑一遍，避免 engines 写着能用、实际跑不起来。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Environment
+        run: node -v && npm -v
+
+      - name: Unit tests
+        run: node --test --experimental-test-isolation=none "test/*.test.mjs"
+
+      - name: Self-checks
+        run: |
+          node test/check-client.mjs
+          node test/check-diff.mjs
