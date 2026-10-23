@@ -60,36 +60,133 @@ function stringList(value) {
 }
 
 /**
- * 模块级 disposer 队列。
+ * 跨 apply 实例的 disposer 注册表，挂在 globalThis 上。
  *
  * 宿主不会替我们管理这条路由的生命周期：`webServer.register()` 返回的删除函数
  * 如果丢掉，热卸载或重新 apply 之后，旧 handler 会一直持有旧 state 继续应答，
- * 而新 host 注册同一路径会撞上 duplicate route。放在模块级而不是闭包里，是为了
- * 让「下一次 apply」能先摘掉「上一次」留下的东西。
+ * 而新 host 注册同一路径会撞上 duplicate route。
+ *
+ * 关键点是这个注册表**不能放模块作用域**：文件一改，宿主热重载会重新求值整个模块，
+ * 模块级变量跟着换成新的空表，旧实例的 route / watcher / 定时器就再也够不着了 ——
+ * 日志里那两条 "duplicate exact route" 就是这么来的。globalThis 在重载前后是同一个
+ * 对象，新模块能看见旧实例留下的清理函数。
  */
-const moduleDisposers = []
+const DISPOSER_REGISTRY = Symbol.for('vertixara.dsh-prompt-manager/disposers')
+
+function registry() {
+  let entry = globalThis[DISPOSER_REGISTRY]
+  if (!entry) {
+    entry = { current: null, all: new Set() }
+    globalThis[DISPOSER_REGISTRY] = entry
+  }
+  return entry
+}
 
 function trackDisposer(dispose) {
-  if (typeof dispose === 'function') moduleDisposers.push(dispose)
+  if (typeof dispose !== 'function') return
+  const entry = registry()
+  if (!entry.current) {
+    entry.current = []
+    entry.all.add(entry.current)
+  }
+  entry.current.push(dispose)
 }
 
 function disposeAll() {
-  while (moduleDisposers.length) {
-    const dispose = moduleDisposers.pop()
+  const entry = registry()
+  for (const list of entry.all) {
+    while (list.length) {
+      const dispose = list.pop()
+      try {
+        dispose()
+      } catch {
+        /* 清理失败不应阻断后续清理 */
+      }
+    }
+  }
+  entry.all.clear()
+  entry.current = null
+}
+
+/**
+ * 当前 apply 实例的 store 快照入口。
+ *
+ * assemble hook 注册在 agent 的 ctx 上，热重载能摘掉宿主那边的注册，却摘不掉已经
+ * 挂到 agent 上的那一个。于是旧 hook 会继续被调用 —— 如果它读的是自己闭包里的
+ * state，那份 state 已经不再被 watcher 更新，面板改什么都看不见。
+ * 让它每次现取最新的 state，旧 hook 就自动跟上了新实例的数据。
+ */
+function currentState(fallback) {
+  const entry = registry()
+  return entry.state ?? fallback
+}
+
+/**
+ * per-agent 状态的载体。
+ *
+ * 挂在 agent 对象上（Symbol 键）而不是 apply 闭包里：热重载会重新求值整个模块，
+ * 闭包和模块级 Map 全部重建，而 agent 活在宿主里、跨重载存活。状态放在 agent 上，
+ * 新 apply 就能认出「这个 agent 已经注册过 section 和 assemble hook」，既不重复挂，
+ * 也能先把旧的那份摘干净。
+ */
+const AGENT_STATE = Symbol.for('vertixara.dsh-prompt-manager/agent-state')
+const AGENT_REGISTRY = Symbol.for('vertixara.dsh-prompt-manager/agents')
+
+function liveAgents() {
+  let set = globalThis[AGENT_REGISTRY]
+  if (!set) {
+    set = new Set()
+    globalThis[AGENT_REGISTRY] = set
+  }
+  return set
+}
+
+function agentStateOf(agent) {
+  if (!agent || (typeof agent !== 'object' && typeof agent !== 'function')) return null
+  let state = agent[AGENT_STATE]
+  if (!state) {
+    state = { cleanups: [], hookAttached: false }
+    try {
+      agent[AGENT_STATE] = state
+      liveAgents().add(agent)
+    } catch {
+      return null
+    }
+  }
+  return state
+}
+
+/** 摘掉这个 agent 上的全部注册；hookAttached 复位，允许重新挂。 */
+function releaseAgent(agent) {
+  const state = agent?.[AGENT_STATE]
+  if (!state) return
+  for (const dispose of state.cleanups.splice(0)) {
     try {
       dispose()
     } catch {
-      /* 清理失败不应阻断后续清理 */
+      /* 单个清理失败不影响其余 */
     }
   }
+  state.hookAttached = false
 }
 
 export function apply(ctx, config = {}) {
   // 上一次 apply 的残留先摘掉，否则注册同一路径会抛 duplicate route。
   disposeAll()
+  trackDisposer(() => {}) // 建立本次 apply 的列表，后续 trackDisposer 归到这里
+  // 清理钩子必须挂在这里，而不是 apply 末尾：后面任何一步抛错，末尾那行就执行不到，
+  // 这一次 apply 注册的东西就会永久留在宿主里。事件名按宿主实际提供的来，不存在就跳过。
+  for (const event of ['dispose', 'teardown']) {
+    try {
+      ctx.on(event, disposeAll)
+    } catch {
+      /* 宿主没有这个事件 */
+    }
+  }
   const storeFile = (config && config.storeFile) || join(dshHome(), 'prompt-manager.json')
   const state = { document: emptyDocument() }
-  const agentCleanups = new Map()
+  // 登记给 globalThis：热重载后仍留在 agent 上的旧 hook 从这里取到最新的 store。
+  registry().state = state
   const runningAgents = new Map()
   const sessionFacts = new Map()
   // 最近一次真实装配的内容，按 sessionId 存放，供面板枚举 agent 作用域的段落。
@@ -601,18 +698,7 @@ export function apply(ctx, config = {}) {
   }
 
   function cleanupAgentSections(agent) {
-    const key = sessionIdOf(agent)
-    if (!key) return
-    const cleanups = agentCleanups.get(key)
-    if (!cleanups) return
-    for (const dispose of cleanups) {
-      try {
-        dispose()
-      } catch {
-        /* best effort */
-      }
-    }
-    agentCleanups.delete(key)
+    releaseAgent(agent)
   }
 
   function syncAgentSections(agent) {
@@ -623,13 +709,22 @@ export function apply(ctx, config = {}) {
       sessionFacts.set(sessionId, facts)
       freezeBaseline(sessionId)
     }
-    cleanupAgentSections(agent)
+    const state = agentStateOf(agent)
+    if (!state) return
+    // 只摘 section，保留 hookAttached：assemble hook 是独立的一次性注册，
+    // 不能因为条目变化就被拆掉重挂。
+    for (const dispose of state.cleanups.splice(0)) {
+      try {
+        dispose()
+      } catch {
+        /* best effort */
+      }
+    }
     // 静态层：全局 + 未开启后注入的工作区条目。动态层交给 assemble waterfall。
     const items = resolveStaticItems(facts)
-    const cleanups = []
     for (const item of items) {
       try {
-        cleanups.push(agent.ctx.systemPrompt.section({
+        state.cleanups.push(agent.ctx.systemPrompt.section({
           name: sectionName(item.id, item.source),
           order: item.order,
           text: item.text,
@@ -641,11 +736,8 @@ export function apply(ctx, config = {}) {
         log(`register-failed ${item.id}: ${error?.message ?? error}`)
       }
     }
-    if (sessionId) agentCleanups.set(sessionId, cleanups)
     diag(`agent-sections sid=${sessionId || '-'} cwd=${facts.cwd || '-'} items=${items.length}`)
   }
-
-  const assembleHookAgents = new WeakSet()
 
   /**
    * 静态 section 只在注册那一刻进入装配结果：对已经在运行的 agent，之后再
@@ -677,8 +769,9 @@ export function apply(ctx, config = {}) {
   }
 
   function attachAssembleHook(agent) {
-    if (!agent?.ctx?.on || assembleHookAgents.has(agent)) return
-    assembleHookAgents.add(agent)
+    if (!agent?.ctx?.on) return
+    const agentState = agentStateOf(agent)
+    if (!agentState || agentState.hookAttached) return
     const sessionId = sessionIdOf(agent)
     const facts = { sessionId, cwd: workingDirectoryOf(agent), ...agentFacts(agent) }
     if (sessionId) {
@@ -686,9 +779,11 @@ export function apply(ctx, config = {}) {
       freezeBaseline(sessionId)
     }
     try {
-      agent.ctx.on('system-prompt/assemble', (assembly) => {
+      const disposeHook = agent.ctx.on('system-prompt/assemble', (assembly) => {
         try {
-          const overrides = state.document.overrides
+          // 现取最新 store：这个 hook 可能属于上一个 apply 实例（热重载摘不掉它），
+          // 读闭包里的 state 会永远停在重载前那份文档上。
+          const overrides = currentState(state).document.overrides
           // 总开关不冻结：它是全局刹车，要立刻有效。
           const active = overrides?.enabled === true
           // 全局规则取会话启动时的基线（主页改动只对新会话生效）；
@@ -775,8 +870,11 @@ export function apply(ctx, config = {}) {
           return assembly
         }
       })
+      if (typeof disposeHook === 'function') agentState.cleanups.push(disposeHook)
+      agentState.hookAttached = true
       diag(`assemble-hook-attached sid=${sessionId || '-'}`)
     } catch (error) {
+      agentState.hookAttached = false
       diag(`assemble-hook-attach-failed ${error?.message ?? error}`)
     }
   }
@@ -1589,7 +1687,8 @@ export function apply(ctx, config = {}) {
   diag(`apply-enter v2 tools=${typeof ctx.tools} systemPrompt=${typeof ctx.systemPrompt} webServer=${typeof ctx.webServer}`)
 
   try {
-    ctx.tools.register(toolDefinition)
+    // 工具的 disposer 同样要留：热重载后旧工具不摘，宿主里就会出现两份同名工具。
+    trackDisposer(ctx.tools.register(toolDefinition))
     diag('tool-registered')
   } catch (error) {
     diag(`tool-register-failed ${error?.stack ?? error}`)
@@ -1613,12 +1712,22 @@ export function apply(ctx, config = {}) {
 
   ctx.on('agent/disposed', (payload) => {
     try {
-      const sessionId = sessionIdOf(payload?.agent)
+      const agent = payload?.agent
+      const sessionId = sessionIdOf(agent)
       if (sessionId) {
         runningAgents.delete(sessionId)
         sessionFacts.delete(sessionId)
       }
-      cleanupAgentSections(payload?.agent)
+      cleanupAgentSections(agent)
+      // agent 已经没了，把它从跨重载的登记表里去掉，否则下一次 apply 还会试图接管它。
+      if (agent) {
+        liveAgents().delete(agent)
+        try {
+          delete agent[AGENT_STATE]
+        } catch {
+          /* agent 可能被冻结，忽略 */
+        }
+      }
     } catch {
       /* best effort */
     }
@@ -1629,16 +1738,6 @@ export function apply(ctx, config = {}) {
     diag('watcher-started')
   } catch (error) {
     diag(`watcher-failed ${error?.stack ?? error}`)
-  }
-
-  // 插件卸载 / 热重载时摘掉路由、watcher 与定时器。事件名按宿主实际提供的来，
-  // 不存在就静默跳过——但不能不注册，否则旧 handler 会一直留在宿主的路由表里。
-  for (const event of ['dispose', 'teardown']) {
-    try {
-      ctx.on(event, disposeAll)
-    } catch {
-      /* 宿主没有这个事件 */
-    }
   }
 
   diag('apply-ready v2')

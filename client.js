@@ -1561,25 +1561,38 @@ window.__ModuleLoader__.load({
       apply(ctx) {
         const slots = ctx.slots
         const disposers = []
+        // slots.inject 的回调返回值不一定会被它接管。注册出来的 disposer 如果只交给
+        // inject，热重载换成另一份 apply 时旧注册就留在 slot 表里，同一个 id 再注册
+        // 一次会撞车 —— 面板上的表现就是那个页签凭空消失。两条都收，确保摘得掉。
+        const track = (dispose) => {
+          if (typeof dispose === 'function') disposers.push(dispose)
+        }
+        const seat = (slot, spec, component) => {
+          track(slots.inject(slot, () => {
+            const dispose = slots.register(spec, component)
+            track(dispose)
+            return dispose
+          }))
+        }
 
-        disposers.push(slots.inject('sidebar.panellist', () => slots.register({
+        seat('sidebar.panellist', {
           name: 'sidebar.panellist',
           id: PANEL_ID,
           order: 40,
           label: () => '提示词',
-        }, PanelIcon)))
+        }, PanelIcon)
 
-        disposers.push(slots.inject('main', () => slots.register({
+        seat('main', {
           name: 'main',
           key: PANEL_ID,
-        }, PanelPage)))
+        }, PanelPage)
 
-        disposers.push(slots.inject('conversation.view', () => slots.register({
+        seat('conversation.view', {
           name: 'conversation.view',
           id: PANEL_ID,
           order: 40,
           label: () => '提示词',
-        }, SessionView)))
+        }, SessionView)
 
         return () => {
           for (const dispose of disposers.splice(0)) dispose()
