@@ -1,0 +1,41 @@
+name: Release
+
+# 推一个 v* 标签就发布：跑测试 → 打包 → 建 release 并把 tarball 挂上去。
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # 测试不过就不发版，避免挂一个跑不起来的包出去
+      - name: Test
+        run: node --test --test-isolation=none "test/*.test.mjs"
+
+      - name: Self-checks
+        run: |
+          node test/check-client.mjs
+          node test/check-diff.mjs
+
+      - name: Pack
+        run: npm pack
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            ./*.tgz
