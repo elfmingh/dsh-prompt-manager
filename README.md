@@ -326,9 +326,9 @@ npm run check:client     # 客户端工厂能否被 ModuleLoader 加载 / client
 
 **Tests run the real `apply()` in-process against a mock ctx;** no DSH process is needed, and `$DSH_HOME` points at a temp directory so real storage is untouched. `--experimental-test-isolation=none` is required: in a confined sandbox `node --test` otherwise spawns a child process per file, which gets denied with EPERM.
 
-CI 在 Node 22 和 24 上各跑一遍，推 `v*` 标签会自动跑测试、打包并发布 release。
+CI 在 Node 22 和 24 上各跑一遍。推 `v*` 标签触发完整的自动化交付：校验标签与 `package.json` 版本一致 → 跑测试与自检 → 发 npm（带 provenance）→ 等 registry 可见 → 建 GitHub release 并挂上 tarball。任一步失败后续不执行，不会出现「npm 上有版本但仓库没产物」这类漂移。
 
-**CI runs on both Node 22 and 24;** pushing a `v*` tag runs the tests, packs, and publishes a release.
+**CI runs on both Node 22 and 24.** Pushing a `v*` tag triggers the full delivery pipeline: check that the tag matches `package.json` → run tests and self-checks → publish to npm with provenance → wait until the version is actually visible on the registry → create the GitHub release with the tarball attached. A failure at any step stops everything after it, so npm and the repo cannot drift apart.
 
 维护脚本 / Maintenance scripts:
 
@@ -341,9 +341,9 @@ node scripts/find-in-asar.mjs "要搜的文本" [前后字符数]               
 
 **The first writes the `?view=assembled` result to `docs/snapshots/sections-<timestamp>.{json,md}`** for version comparison. Both `docs/snapshots/` and `research/` are gitignored: they contain local paths and session content and stay out of the public repo.
 
-发布用 `npm publish`。`publishConfig.access` 已是 `public`，`files` 白名单只含运行时文件。
+发布是全自动的：改 `package.json` 的 `version`，提交，打同名标签推上去，剩下的交给流水线。`publishConfig.access` 已是 `public`，`files` 白名单只含运行时文件。CI 需要仓库里有个 `NPM_TOKEN` secret（npm Granular Access Token，权限限定到本包）。
 
-**Publish with `npm publish`.** `publishConfig.access` is already `public`, and the `files` whitelist covers runtime files only.
+**Publishing is fully automated:** bump `version` in `package.json`, commit, push a matching tag, and the pipeline does the rest. `publishConfig.access` is already `public` and the `files` whitelist covers runtime files only. CI needs an `NPM_TOKEN` secret scoped to this package.
 
 ## ⚠️ 已知限制 · Known limitations
 

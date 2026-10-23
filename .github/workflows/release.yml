@@ -1,16 +1,27 @@
 name: Release
 
-# 推一个 v* 标签就发布：跑测试 → 打包 → 建 release 并把 tarball 挂上去。
+# 推一个 v* 标签 = 一次完整交付：校验版本 → 跑测试 → 发 npm → 发 GitHub release。
+# 任一步失败，后面都不执行 —— 避免出现「npm 上有版本但仓库没产物」或反过来的漂移。
 on:
   push:
     tags:
       - 'v*'
 
 permissions:
-  contents: write
+  contents: write     # 建 release、上传产物
+  id-token: write     # npm provenance 签名
+
+# 同一标签重复触发时排队而不是并发，否则两次 publish 会互相踩
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  PACKAGE: '@vertixara/dsh-prompt-manager'
 
 jobs:
-  release:
+  verify:
+    name: Verify
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -22,7 +33,19 @@ jobs:
       - name: Environment
         run: node -v && npm -v
 
-      # 测试不过就不发版，避免挂一个跑不起来的包出去
+      # 自动化发布最容易出的事故：标签和 package.json 版本对不上，
+      # 结果 npm 上多出一个谁也对不上的版本号，而 npm 不允许覆盖重发。
+      - name: Tag agrees with package.json
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p "require('./package.json').version")"
+          echo "tag=$tag  package.json=$pkg"
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::标签 $tag 与 package.json 的 $pkg 不一致，两者必须相同"
+            exit 1
+          fi
+
       - name: Test
         run: node --test --test-isolation=none "test/*.test.mjs"
 
@@ -31,31 +54,105 @@ jobs:
           node test/check-client.mjs
           node test/check-diff.mjs
 
+  npm:
+    name: Publish to npm
+    needs: verify
+    runs-on: ubuntu-latest
+    outputs:
+      published: ${{ steps.publish.outputs.published }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
       - name: Pack
         run: npm pack
 
-      - name: Release
+      - name: Publish
+        id: publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+
+          # 幂等：已存在的版本不重发。重推标签只为刷新 GitHub 产物时必须走到这里，
+          # 否则 npm 会以 403 拒绝，把整条交付流程变红。
+          if npm view "$PACKAGE@$version" version >/dev/null 2>&1; then
+            echo "::notice::$PACKAGE@$version 已存在于 npm，跳过发布"
+            echo "published=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "::error::缺少 NPM_TOKEN。把 npm 的 Granular Access Token 存进仓库 Secrets，或改用 OIDC trusted publishing。"
+            exit 1
+          fi
+
+          # --provenance 让 npm 页面显示构建来源：这条 tarball 出自哪个仓库的哪次运行，
+          # 用户据此可以把装到的包和某个 commit 对起来。
+          npm publish --provenance
+          echo "published=true" >> "$GITHUB_OUTPUT"
+
+      # 发出去不等于能装到。registry 是最终一致的，这里轮询到真正可见为止，
+      # 免得下游在窗口期里装到上一版。
+      - name: Confirm it on the registry
+        if: steps.publish.outputs.published == 'true'
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          for i in $(seq 1 12); do
+            if npm view "$PACKAGE@$version" version >/dev/null 2>&1; then
+              echo "registry 已可见 $PACKAGE@$version"
+              exit 0
+            fi
+            echo "等待 registry 生效… $i/12"
+            sleep 5
+          done
+          echo "::error::发布命令返回成功，但 60 秒内 registry 仍查不到 $PACKAGE@$version"
+          exit 1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tarball
+          path: ./*.tgz
+
+  github-release:
+    name: GitHub release
+    needs: npm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: tarball
+
+      - name: Create or update release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -e
-          TAG="$GITHUB_REF_NAME"
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
 
-          # 标签重推（例如改了包名）时，原 release 会因失去 tag 绑定退化成 draft，
+          # 标签重推（例如改包名）时，原 release 会因失去 tag 绑定退化成 draft，
           # 所以已存在时不但要覆盖产物，还要显式发布
-          if gh release view "$TAG" >/dev/null 2>&1; then
+          if gh release view "$tag" >/dev/null 2>&1; then
             echo "release 已存在，覆盖产物并确保已发布"
-            gh release upload "$TAG" ./*.tgz --clobber
-            gh release edit "$TAG" --draft=false --title "$TAG"
+            gh release upload "$tag" ./*.tgz --clobber
+            gh release edit "$tag" --draft=false --title "$tag"
           else
-            gh release create "$TAG" --title "$TAG" --generate-notes ./*.tgz
+            gh release create "$tag" --title "$tag" --generate-notes ./*.tgz
           fi
 
           # 清掉不属于本次构建的遗留产物：以刚打出来的 tgz 文件名为白名单
           keep=$(ls ./*.tgz | xargs -n1 basename | tr '\n' ' ')
-          gh release view "$TAG" --json assets -q '.assets[].name' | while read -r asset; do
+          gh release view "$tag" --json assets -q '.assets[].name' | while read -r asset; do
             case " $keep " in
               *" $asset "*) ;;
-              *) echo "删除旧产物: $asset"; gh release delete-asset "$TAG" "$asset" -y ;;
+              *) echo "删除旧产物: $asset"; gh release delete-asset "$tag" "$asset" -y ;;
             esac
           done
