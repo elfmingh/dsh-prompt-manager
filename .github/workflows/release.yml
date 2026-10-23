@@ -51,11 +51,11 @@ jobs:
             gh release create "$TAG" --title "$TAG" --generate-notes ./*.tgz
           fi
 
-          # 清掉不属于当前包名的遗留产物
-          scope=$(node -p "require('./package.json').name.split('/').pop()")
+          # 清掉不属于本次构建的遗留产物：以刚打出来的 tgz 文件名为白名单
+          keep=$(ls ./*.tgz | xargs -n1 basename | tr '\n' ' ')
           gh release view "$TAG" --json assets -q '.assets[].name' | while read -r asset; do
-            case "$asset" in
-              "$scope"-*) ;;
-              *) gh release delete-asset "$TAG" "$asset" -y ;;
+            case " $keep " in
+              *" $asset "*) ;;
+              *) echo "删除旧产物: $asset"; gh release delete-asset "$TAG" "$asset" -y ;;
             esac
           done
