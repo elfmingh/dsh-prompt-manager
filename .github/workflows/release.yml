@@ -41,14 +41,15 @@ jobs:
           set -e
           TAG="$GITHUB_REF_NAME"
 
-          # 标签重推（例如改了包名）时 release 可能已存在，那边只覆盖产物不重建
+          # 标签重推（例如改了包名）时，原 release 会因失去 tag 绑定退化成 draft，
+          # 所以已存在时不但要覆盖产物，还要显式发布
           if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "release 已存在，覆盖产物"
+            echo "release 已存在，覆盖产物并确保已发布"
+            gh release upload "$TAG" ./*.tgz --clobber
+            gh release edit "$TAG" --draft=false --title "$TAG"
           else
-            gh release create "$TAG" --title "$TAG" --generate-notes
+            gh release create "$TAG" --title "$TAG" --generate-notes ./*.tgz
           fi
-
-          gh release upload "$TAG" ./*.tgz --clobber
 
           # 清掉不属于当前包名的遗留产物
           scope=$(node -p "require('./package.json').name.split('/').pop()")
