@@ -1,5 +1,5 @@
 /**
- * @vertixara/dsh-prompt-manager  (0.2.3，数据模型 v2)
+ * @vertixara/dsh-prompt-manager  (0.2.4，数据模型 v2)
  *
  * 数据模型 v2 —— "档案 / 应用 / 临时"三分：
  *   entries      长期条目档案：只存定义 { id, title, text, order }，不带作用域

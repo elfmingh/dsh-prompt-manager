@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.2.4 — 2026-10-23
+
+修复热重载后的注册泄漏。无 API 变更，无数据结构变更（仍是 v2）。
+
+### 修复
+
+- **热重载不再撞重复路由**。disposer 注册表原先放在模块作用域，宿主重新求值模块时它被换成新的空表，旧实例留在宿主路由表里的 `/prompt-manager/api` 就再也摘不掉；下一次 apply 注册同一路径直接抛 `duplicate exact route`，新 handler 挂不上去，面板一直拿到旧闭包。注册表改挂 `globalThis`（`Symbol.for` 键），跨模块重载存活。
+- **清理钩子提前到 apply 开头**。原先挂在末尾，中间任何一步抛错它就执行不到，整次 apply 的注册全部泄漏。
+- **`ctx.tools.register` 的 disposer 纳入清理**，避免宿主里出现两份同名工具。
+- **per-agent 状态改挂 agent 对象**（Symbol 键）。section 的 disposers 和「hook 是否已挂」原先存在 apply 闭包里，重载后新实例认不出旧 agent：要么重复挂一遍，要么摘不掉旧的那份。agent 对象跨重载存活，可以据此判断。
+- **assemble hook 现取最新 store**。hook 注册在 agent 的 ctx 上，热重载摘不掉它；它原先读闭包里的 `state`，而那份文档不再被 watcher 更新——表现就是面板改了设置、已存在的会话毫无反应。
+- **会话页签不再消失**。`slots.inject` 回调里只返回了 `slots.register` 的 disposer 而没有另存一份；热重载时旧注册留在 slot 表里，同一个 id 再次注册撞车。现在两条都收。
+
+### 说明
+
+「全局规则只对新会话生效」不是缺陷：`freezeBaseline` 在会话首次装配时冻结当时的全局规则，避免提示词前缀一变就作废整段服务端缓存。要改当前会话，去会话页单独特调。
+
 ## 0.2.3 — 2026-10-23
 
 README 中英双语，发布全自动化。无运行时代码改动。
