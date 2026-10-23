@@ -71,10 +71,21 @@ jobs:
       - name: Pack
         run: npm pack
 
+      # OIDC 认证要 npm CLI >= 11.5.1（Node 22.14+ 才有）。版本不够时
+      # publish 会退回 token 认证，而这里已经没有 token 了，所以先拦住。
+      - name: npm CLI supports OIDC
+        run: |
+          set -euo pipefail
+          node -e '
+            const v = require("node:child_process").execSync("npm -v").toString().trim();
+            const [maj, min, pat] = v.split(".").map(Number);
+            console.log("npm", v);
+            const ok = maj > 11 || (maj === 11 && (min > 5 || (min === 5 && pat >= 1)));
+            if (!ok) { console.error(`npm ${v} 过低，OIDC 需要 >= 11.5.1`); process.exit(1); }
+          '
+
       - name: Publish
         id: publish
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -uo pipefail
           version="${GITHUB_REF_NAME#v}"
@@ -87,26 +98,18 @@ jobs:
             exit 0
           fi
 
-          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
-            echo "::error title=缺少凭据::仓库 Secrets 里没有 NPM_TOKEN"
-            exit 1
-          fi
-
-          # 先问清楚这个 token 是谁、能不能写。凭证问题在这里暴露，
-          # 比等 publish 返回一个 403 更容易定位。
-          if ! user="$(npm whoami 2>&1)"; then
-            echo "::error title=token 无效::npm whoami 失败 —— ${user}"
-            exit 1
-          fi
-          echo "token 归属用户: $user"
-          echo "--- token 可写的包 ---"
-          npm access list packages 2>&1 | head -20 || true
-          echo "---------------------"
-
+          # 认证走 OIDC trusted publishing：npm CLI 自己发现 Actions 的 OIDC 环境，
+          # 拿一个短期的 workflow 身份令牌去换发布令牌。没有长期 token 可泄露，
+          # 也不会再撞上「This operation requires a one-time password」——
+          # 密钥不在 CI 里，就没有 2FA 需要满足。
+          #
+          # provenance 由 npm 在 OIDC 发布时自动生成（公开仓库 + 公开包），
+          # 不需要 --provenance 参数。
+          #
           # npm 把失败原因只写进日志，而日志要登录才能下载。
           # 这里自己收集输出，把关键行转成 annotation，直接显示在 Actions 页面。
           set +e
-          output="$(npm publish --provenance 2>&1)"
+          output="$(npm publish 2>&1)"
           status=$?
           set -e
           printf '%s\n' "$output"
@@ -114,7 +117,7 @@ jobs:
           if [ "$status" -ne 0 ]; then
             echo "::error title=npm publish 失败（exit $status）::原因见下方逐条注解"
             printf '%s\n' "$output" \
-              | grep -Ei 'npm (error|warn)|E[0-9]{3}|forbidden|two-factor|OTP|unauthor' \
+              | grep -Ei 'npm (error|warn)|E[0-9]{3}|forbidden|two-factor|OTP|unauthor|OIDC|trusted' \
               | head -15 \
               | while IFS= read -r line; do
                   echo "::error::${line}"
