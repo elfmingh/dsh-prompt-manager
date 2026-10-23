@@ -262,6 +262,31 @@ node scripts/find-in-asar.mjs "要搜的文本" [前后字符数]               
 - 面板显示的 tools 数量取决于目标会话是否产生过装配
 - `complete` 段落会在 waterfall 之后被框架还原，对它做改写无效（当前环境未观测到）
 
+## 👤 作者
+
+| 参与者 | 负责 |
+|---|---|
+| **Vertixara** | 需求、设计取舍与验收 |
+| **DeepSeek Harness 内的 AI 助手** | 实现、核查、测试与文档 |
+| **GPT** | 独立代码审计（[审计报告](docs/audit-2026-10-23.md)）：查出 2 项 P1、8 项 P2 |
+
+- 邮箱：<public@vertixara.com>
+- 仓库：<https://github.com/elfmingh/dsh-prompt-manager>
+- 问题反馈：<https://github.com/elfmingh/dsh-prompt-manager/issues>
+- 变更记录：[CHANGELOG.md](CHANGELOG.md)
+
+发现安全问题请直接发邮件，不要开公开 issue。
+
+## 🤖 关于这份代码
+
+Host 端、Web 客户端、测试与 CI 绝大多数是与 AI 结对写成的：需求、取舍和验收由 Vertixara 拍板，实现、核查与修复由 DeepSeek Harness 内的 AI 执行，审计由 GPT 独立完成。
+
+写下这一点是为了让后来者知道按什么标准读它 —— 哪些结论经过了真机验证、哪些只有单元测试覆盖，都写在下面这段历史里：
+
+- 0.2.1 的十项修复来自 GPT 的独立审计（报告保留在 [`docs/audit-2026-10-23.md`](docs/audit-2026-10-23.md)），每条都回到代码和宿主源码逐条复核后才动手，未发现误报；其中鉴权、并发写入、路由生命周期三项在真实运行的 DSH 上做过验证。
+- 剩下七项由 59 个用例覆盖，每条用例名带审计编号。测试全部在进程内用 mock ctx 跑真实 `apply()`，不需要起 DSH 进程。
+- README 里关于宿主行为的断言（`interpolate: false` 的语义、`register()` 没有鉴权层、`section()` 只在创建时注册）都读过宿主安装包里的实际实现，不是推测。
+
 ## 📄 License
 
 [MIT](LICENSE)

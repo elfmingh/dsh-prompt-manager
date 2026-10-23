@@ -1,8 +1,17 @@
 # Changelog
 
+## 0.2.2 — 2026-10-23
+
+署名与包元数据。无运行时代码改动。
+
+- **版权主体明确为 Vertixara**。`LICENSE` 原先写的是占位的 `dsh-prompt-manager contributors`，现在改为 `Copyright (c) 2026 Vertixara`。
+- **补齐 npm 元数据**。`author`、`repository`、`homepage`、`bugs` 此前全部缺失，npm 包页面因此没有作者与仓库信息。
+- **README 增加作者与开发说明**。写明三方分工：Vertixara 负责需求与验收、DeepSeek Harness 内的 AI 助手负责实现与核查、GPT 负责独立审计；并标注哪些结论经过真机验证、哪些只有单测覆盖。
+- **审计报告标注审计方**。`docs/audit-2026-10-23.md` 头部写明由 GPT 独立审查（与实现方不是同一个模型）。
+
 ## 0.2.1 — 2026-10-23
 
-按 `docs/audit-2026-10-23.md` 的三方审计结果修复：2 项 P1、8 项 P2。测试从 41 条增加到 59 条，每项修复都有对应的回归用例。
+按 GPT 出具的独立审计（[`docs/audit-2026-10-23.md`](docs/audit-2026-10-23.md)）修复：2 项 P1、8 项 P2。测试从 41 条增加到 59 条，每项修复都有对应的回归用例。
 
 ### 安全
 
