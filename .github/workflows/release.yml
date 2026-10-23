@@ -76,7 +76,7 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
           version="${GITHUB_REF_NAME#v}"
 
           # 幂等：已存在的版本不重发。重推标签只为刷新 GitHub 产物时必须走到这里，
@@ -88,13 +88,40 @@ jobs:
           fi
 
           if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
-            echo "::error::缺少 NPM_TOKEN。把 npm 的 Granular Access Token 存进仓库 Secrets，或改用 OIDC trusted publishing。"
+            echo "::error title=缺少凭据::仓库 Secrets 里没有 NPM_TOKEN"
             exit 1
           fi
 
-          # --provenance 让 npm 页面显示构建来源：这条 tarball 出自哪个仓库的哪次运行，
-          # 用户据此可以把装到的包和某个 commit 对起来。
-          npm publish --provenance
+          # 先问清楚这个 token 是谁、能不能写。凭证问题在这里暴露，
+          # 比等 publish 返回一个 403 更容易定位。
+          if ! user="$(npm whoami 2>&1)"; then
+            echo "::error title=token 无效::npm whoami 失败 —— ${user}"
+            exit 1
+          fi
+          echo "token 归属用户: $user"
+          echo "--- token 可写的包 ---"
+          npm access list packages 2>&1 | head -20 || true
+          echo "---------------------"
+
+          # npm 把失败原因只写进日志，而日志要登录才能下载。
+          # 这里自己收集输出，把关键行转成 annotation，直接显示在 Actions 页面。
+          set +e
+          output="$(npm publish --provenance 2>&1)"
+          status=$?
+          set -e
+          printf '%s\n' "$output"
+
+          if [ "$status" -ne 0 ]; then
+            echo "::error title=npm publish 失败（exit $status）::原因见下方逐条注解"
+            printf '%s\n' "$output" \
+              | grep -Ei 'npm (error|warn)|E[0-9]{3}|forbidden|two-factor|OTP|unauthor' \
+              | head -15 \
+              | while IFS= read -r line; do
+                  echo "::error::${line}"
+                done || true
+            exit "$status"
+          fi
+
           echo "published=true" >> "$GITHUB_OUTPUT"
 
       # 发出去不等于能装到。registry 是最终一致的，这里轮询到真正可见为止，
