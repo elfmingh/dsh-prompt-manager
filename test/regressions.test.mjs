@@ -222,6 +222,29 @@ test('#19 首次读取失败时不迁移，保住旧 agent 注册表', () => wit
   assert.equal(
     agent.listenerCount('system-prompt/assemble'),
     hooksBefore,
-    '读取失败时不应摘掉或重挂 hook',
+    '加载失败时不应摘掉或重挂 hook',
   )
+}))
+
+test('#20 旧版 registry 缺少后来新增的字段时自动补齐', () => withHarness(async (harness) => {
+  harness.createAgent('s1')
+
+  // 3b6ce18 留下的 entry：存在，但没有 agents / lastDocument。
+  harness.simulateLegacyRegistryShape()
+
+  // 热升级。不补齐的话 runningAgents 是 undefined，紧接着的 .set / .entries
+  // 会抛 TypeError —— 而 agent/created 的监听有 try/catch，异常被记成日志，
+  // 于是「会话建不起来但没人报错」。所以这里直接断言表结构，不靠行为反推。
+  await harness.reapply()
+
+  const entry = globalThis[Symbol.for(`vertixara.dsh-prompt-manager/disposers:${harness.storeFile}`)]
+  assert.ok(entry, '热重载后 registry 应当仍然存在')
+  assert.ok(entry.agents instanceof Map, '缺的 agents 字段应当被补成 Map')
+  assert.ok(entry.all instanceof Set, '缺的 all 字段应当被补成 Set')
+  assert.ok('lastDocument' in entry, '缺的 lastDocument 字段应当被补上')
+
+  // 补完之后这些路径要能真的走通，而不是靠 catch 吞掉异常。
+  const agent = harness.createAgent('s2')
+  const result = await agent.assemble(fixture())
+  assert.ok(Array.isArray(result.sections), '新实例在补过字段的表上应当正常装配')
 }))

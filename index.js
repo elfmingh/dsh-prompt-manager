@@ -86,6 +86,15 @@ function registry(scope) {
     entry = { current: null, all: new Set(), state: null, lastDocument: null, agents: new Map(), scope }
     globalThis[key] = entry
   }
+  // 补齐字段。热重载时这张表是**上一个版本**留下的：3b6ce18 的 entry 就没有
+  // agents。只在整个 entry 不存在时才初始化，等于假设「表要么在且完整、要么
+  // 不在」—— 升级那一刻它恰恰是「在但不完整」，于是 runningAgents.set / .entries
+  // 直接抛 TypeError，新实例一启动就哑掉。逐字段补，绝不覆盖已有的。
+  if (!(entry.all instanceof Set)) entry.all = new Set()
+  if (!(entry.agents instanceof Map)) entry.agents = new Map()
+  if (!('lastDocument' in entry)) entry.lastDocument = null
+  if (!('state' in entry)) entry.state = null
+  if (!('current' in entry)) entry.current = null
   return entry
 }
 
@@ -376,14 +385,15 @@ export function apply(ctx, config = {}) {
   const runningAgents = registry(storeFile).agents
 
   /**
-   * 上一次 loadStore 是否真的拿到了可信文档。
+   * 表里存的是 WeakRef 而不是 agent 本身。
    *
-   * loadStore 在 I/O 失败、解析失败、归一化失败时都会「回落到当前文档」并返回
-   * 而不是抛错 —— 这是对的，装配不该因为读不到文件就崩。但调用方如果只看
-   * resolved，就分不清「读到了」和「没读到、给了个旧的」，基于错误文档去做
-   * 有永久后果的事（迁移旧 agent、冻结基线）会留下收不回来的状态。
+   * 这张表现在跨热重载存活，真实持有 agent 就变成了跨实例的强引用：插件停用期间
+   * 宿主销毁某个 agent，那个 agent/disposed 监听已经随插件一起被摘掉，Map 永远不会
+   * 收到通知 —— 于是内存里一直攥着一个已经死掉的会话对象。WeakRef 让宿主回收之后
+   * 这里自然落空，deref 不出东西就等于「不在了」。
    */
-  let lastLoadOk = true
+  const liveAgent = (ref) => ref?.deref?.() ?? ref ?? null
+
   const sessionFacts = new Map()
   // 最近一次真实装配的内容，按 sessionId 存放，供面板枚举 agent 作用域的段落。
   const assemblySnapshots = new Map()
@@ -661,7 +671,11 @@ export function apply(ctx, config = {}) {
   // -------------------------------------------------------------- store i/o
 
   async function loadStore() {
-    lastLoadOk = false
+    // 返回 { document, ok }，ok 表示**这一次**加载是否真的拿到了可信文档。
+    //
+    // 不能用实例级变量记这个：首次加载、watcher、工具动作会并发跑，一次失败
+    // 就能把另一次刚置上的成功标志抹掉（或者反过来），于是「该不该做迁移」取决于
+    // 谁后写的，而不是这次加载自己的结果。
     // 读、解析、归一化拆成三段 try。只有「解析」失败才说明文件内容坏了；
     // 早先三者共用一个 catch，于是 EACCES / EIO 这类读取错误也会落进隔离分支，
     // 把一份刚刚保存成功的配置从正式文件上 rename 走 —— 读一次失败就能毁掉
@@ -673,13 +687,12 @@ export function apply(ctx, config = {}) {
       if (error?.code === 'ENOENT') {
         // 没有文件是正常状态（全新安装），算成功读到一个空仓库。
         state.document = emptyDocument()
-        lastLoadOk = true
-        return state.document
+        return { document: state.document, ok: true }
       }
       // 读不到不等于内容坏了。没有证据就不许动用户的数据：保留最后一次有效
       // 文档继续装配（比退回空配置安全），把失败留在日志里。
       log(`load-failed(io) code=${error?.code ?? '-'} ${error?.message ?? error}`)
-      return state.document
+      return { document: state.document, ok: false }
     }
 
     let parsed
@@ -697,7 +710,7 @@ export function apply(ctx, config = {}) {
         log(`store-corrupt ${error?.message ?? error}；隔离原文件失败 ${moveError?.message ?? moveError}`)
       }
       state.document = emptyDocument()
-      return state.document
+      return { document: state.document, ok: false }
     }
 
     let document
@@ -706,10 +719,9 @@ export function apply(ctx, config = {}) {
     } catch (error) {
       // 归一化是纯函数，它抛错说明代码有问题，不是文件有问题 —— 同样不许动数据。
       log(`store-normalize-failed ${error?.message ?? error}`)
-      return state.document
+      return { document: state.document, ok: false }
     }
     state.document = document
-    lastLoadOk = true
     if (!parsed || Number(parsed?.version ?? 1) < STORE_VERSION) {
       try {
         // 走 saveStore 而不是裸 writeFile：迁移同样是「覆盖用户的正式文件」，
@@ -720,7 +732,7 @@ export function apply(ctx, config = {}) {
         diag(`migrate-write-failed ${error?.message ?? error}`)
       }
     }
-    return state.document
+    return { document: state.document, ok: true }
   }
 
   async function saveStore(document) {
@@ -1203,7 +1215,9 @@ function workspaceEntries(document = state.document) {
 
   /** 档案/应用变更后，对仍在运行的会话重新解析。 */
   function refreshRunningAgents() {
-    for (const [sessionId, agent] of [...runningAgents.entries()]) {
+    for (const [sessionId, ref] of [...runningAgents.entries()]) {
+      // 存的是 WeakRef：被宿主回收掉的 agent 在这里落空，顺手把空条目删掉。
+      const agent = liveAgent(ref)
       if (!agent) {
         runningAgents.delete(sessionId)
         continue
@@ -1238,7 +1252,7 @@ function workspaceEntries(document = state.document) {
       for (const agent of [...agents]) {
         try {
           const sessionId = sessionIdOf(agent)
-          if (sessionId) runningAgents.set(sessionId, agent)
+          if (sessionId) runningAgents.set(sessionId, new WeakRef(agent))
           syncAgentSections(agent)
           adopted += 1
         } catch (error) {
@@ -1265,7 +1279,11 @@ function workspaceEntries(document = state.document) {
         reloadTimer = setTimeout(() => {
           reloadTimer = null
           loadStore()
-            .then(() => {
+            .then(({ ok }) => {
+              // 首次加载失败时跳过了迁移；之后任何一次成功加载都该把这次接管补上，
+              // 否则旧 agent 要一直等到下一次 apply 才被收编（期间它们的静态段落
+              // 停在旧文档上）。adoptLegacyAgents 自己幂等：Set 已经消费过就是空转。
+              if (ok) adoptLegacyAgents()
               refreshRunningAgents()
               diag(`store-reloaded entries=${state.document.entries.length}`)
             })
@@ -1349,7 +1367,11 @@ function workspaceEntries(document = state.document) {
       // 所有 action 串行执行，并在锁内重新读盘：并发调用若各自基于内存里的同一份
       // 旧文档修改再写回，就会互相覆盖——两边都返回成功，却只剩一个结果。
       return withWriteLock(async () => {
-        await loadStore()
+        const { ok } = await loadStore()
+        // 首次加载失败时会跳过升级迁移；之后任何一次成功加载都该把这次接管补上，
+        // 否则旧 agent 的静态段落一直停在旧文档上，直到下一次 apply 才恢复。
+        // adoptLegacyAgents 幂等：旧 Set 消费过之后就是空转。
+        if (ok) adoptLegacyAgents()
         return runAction(args)
       })
     },
@@ -1362,7 +1384,8 @@ function workspaceEntries(document = state.document) {
         return `${storeFile}\n(${summary()})`
       }
       if (action === 'reload') {
-        await loadStore()
+        const { ok } = await loadStore()
+        if (ok) adoptLegacyAgents()
         refreshRunningAgents()
         return `已重新载入：${summary()}`
       }
@@ -1907,7 +1930,9 @@ function workspaceEntries(document = state.document) {
               // 用运行中 agent 的 scoped systemPrompt 装配，才能看到注册在 agent 作用域上的
               // prompt-manager 段落；用插件根 ctx 装配只会返回宿主/插件段落。
               const sessionId = url.searchParams.get('sessionId') ?? ''
-              const agent = sessionId ? runningAgents.get(sessionId) : [...runningAgents.values()][0]
+              const agent = sessionId
+                ? liveAgent(runningAgents.get(sessionId))
+                : liveAgent([...runningAgents.values()][0])
               const target = agent?.ctx?.systemPrompt ?? ctx.systemPrompt
               let sections = []
               let contexts = []
@@ -2060,13 +2085,14 @@ function workspaceEntries(document = state.document) {
   }
 
   loadStore()
-    .then((document) => {
+    .then(({ document, ok }) => {
       diag(`initial-load-ok entries=${document.entries.length} temporary=${document.temporary.length}`)
       // 没读到可信文档就不许迁移：这时 state.document 是回落值（全新安装时是空壳），
       // 拿它去同步会把旧 agent 的静态段落按空文档重注册、再冻结一份空基线，
       // 之后文件恢复正常也回不来 —— 磁盘上的规则还在，但没人再读它了。
-      // 保留旧的 agent 注册表，等下一次成功的加载再接。
-      if (!lastLoadOk) {
+      // 保留旧的 agent 注册表，等下一次成功的加载再接（watcher 和工具里的加载
+      // 成功后都会补一次这步）。
+      if (!ok) {
         diag('legacy-adopt-skipped load-failed')
         return
       }
@@ -2087,7 +2113,7 @@ function workspaceEntries(document = state.document) {
     try {
       const agent = payload?.agent
       const sessionId = sessionIdOf(agent)
-      if (sessionId) runningAgents.set(sessionId, agent)
+      if (sessionId) runningAgents.set(sessionId, new WeakRef(agent))
       syncAgentSections(agent)
       attachAssembleHook(agent)
     } catch (error) {

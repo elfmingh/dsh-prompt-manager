@@ -274,6 +274,20 @@ export async function createHarness() {
       const entry = globalThis[Symbol.for(`vertixara.dsh-prompt-manager/disposers:${storeFile}`)]
       if (entry?.agents) entry.agents.clear()
     },
+    /**
+     * 把 registry entry 改造成**上一个版本**的形状：存在，但没有后来新增的字段。
+     *
+     * 热重载时表就是上一个实例留下的，只在整个 entry 不存在时才初始化，等于假设
+     * 「要么在且完整、要么不在」—— 升级那一刻它恰恰是「在但不完整」，随后
+     * runningAgents.set / .entries 直接抛 TypeError。
+     */
+    simulateLegacyRegistryShape: () => {
+      const entry = globalThis[Symbol.for(`vertixara.dsh-prompt-manager/disposers:${storeFile}`)]
+      if (entry) {
+        delete entry.agents
+        delete entry.lastDocument
+      }
+    },
     /** 顶层 ctx 上某个事件挂了多少个 listener（agent 自己的用 createAgent 返回值）。 */
     listenerCount: (event) => (listeners.get(event) ?? []).length,
   }
