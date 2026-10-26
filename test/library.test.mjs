@@ -97,14 +97,14 @@ test('temp.add 在每次装配时后注入', async (t) => {
   const agent = h.createAgent('session-a')
   await h.callTool({ action: 'temp.add', sessionId: 'session-a', title: 'T', text: 'temp text' })
 
-  const result = agent.assemble(fixture())
+  const result = (await agent.assemble(fixture()))
   const injected = result.sections.find((section) => String(section.name).includes('temporary'))
   assert.ok(injected, 'temporary section should be injected')
   assert.equal(injected.text, 'temp text')
 
   // 后注入只影响目标会话。
   const other = h.createAgent('session-b')
-  const otherResult = other.assemble(fixture())
+  const otherResult = (await other.assemble(fixture()))
   assert.equal(otherResult.sections.some((section) => String(section.name).includes('temporary')), false)
 })
 
@@ -117,11 +117,11 @@ test('temp.remove 移除后不再注入', async (t) => {
   const id = h.readStore().temporary[0].id
   assert.ok(added)
 
-  let result = agent.assemble(fixture())
+  let result = (await agent.assemble(fixture()))
   assert.ok(result.sections.some((section) => String(section.name).includes('temporary')))
 
   await h.callTool({ action: 'temp.remove', id, sessionId: 'session-a' })
-  result = agent.assemble(fixture())
+  result = (await agent.assemble(fixture()))
   assert.equal(result.sections.some((section) => String(section.name).includes('temporary')), false)
 })
 
@@ -131,7 +131,7 @@ test('未命中任何规则时装配结果原样返回', async (t) => {
 
   const agent = h.createAgent('session-a')
   const input = fixture()
-  const result = agent.assemble(input)
+  const result = (await agent.assemble(input))
   assert.equal(result.sections.length, 3)
   assert.equal(result.contexts.length, 2)
   assert.equal(result.tools.length, 2)

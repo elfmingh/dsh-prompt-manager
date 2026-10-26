@@ -69,10 +69,10 @@ test('临时条目同样按作用域过滤', async (t) => {
   const main = h.createAgent('session-main')
   const sub = h.createAgent('session-sub', '', subagentHeader)
 
-  const mainResult = main.assemble(fixture())
+  const mainResult = (await main.assemble(fixture()))
   assert.equal(mainResult.sections.some((section) => String(section.name).includes('temporary')), false)
 
-  const subResult = sub.assemble(fixture())
+  const subResult = (await sub.assemble(fixture()))
   assert.ok(subResult.sections.some((section) => String(section.name).includes('temporary')))
 })
 
@@ -126,9 +126,9 @@ test('?view=assembled 标明是不是子代理', async (t) => {
   t.after(h.cleanup)
 
   const main = h.createAgent('session-main')
-  main.assemble(fixture())
+  await main.assemble(fixture())
   const sub = h.createAgent('session-sub', '', subagentHeader)
-  sub.assemble(fixture())
+  await sub.assemble(fixture())
 
   const mainResponse = await h.callHttp('/prompt-manager/api?view=assembled&sessionId=session-main')
   assert.equal(mainResponse.body.subagent, false)

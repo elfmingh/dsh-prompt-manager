@@ -140,7 +140,7 @@ test('#4 主会话的「仅子代理」临时条目能到达子代理', () => wi
   })
 
   const child = harness.createAgent('child', '', { parentSession: 'main', origin: 'subagent' })
-  const injected = child.assemble(fixture()).sections.find((s) => s.name === 'prompt-manager:temporary:temp-child')
+  const injected = (await child.assemble(fixture())).sections.find((s) => s.name === 'prompt-manager:temporary:temp-child')
   assert.ok(injected, '子代理应当收到父会话写的临时条目')
   assert.equal(injected.text, 'for children only')
 }))
@@ -151,11 +151,11 @@ test('#4 多级子代理同样继承，无关会话看不到', () => withHarness
   harness.createAgent('child', '', { parentSession: 'main', origin: 'subagent' })
   const grandchild = harness.createAgent('grandchild', '', { parentSession: 'child', origin: 'subagent' })
 
-  const seen = grandchild.assemble(fixture()).sections.find((s) => s.name === 'prompt-manager:temporary:temp-line')
+  const seen = (await grandchild.assemble(fixture())).sections.find((s) => s.name === 'prompt-manager:temporary:temp-line')
   assert.ok(seen, '孙代理也应当拿到')
 
   const stranger = harness.createAgent('stranger')
-  const notSeen = stranger.assemble(fixture()).sections.find((s) => s.name === 'prompt-manager:temporary:temp-line')
+  const notSeen = (await stranger.assemble(fixture())).sections.find((s) => s.name === 'prompt-manager:temporary:temp-line')
   assert.equal(notSeen, undefined, '无关会话不应看到')
 }))
 
@@ -172,7 +172,7 @@ test('#5 临时条目的 replace 规则真的生效', () => withHarness(async (h
     sessionId: 's1',
   })
 
-  const section = agent.assemble(fixture()).sections.find((s) => s.name === 'prompt-manager:temporary:dyn')
+  const section = (await agent.assemble(fixture())).sections.find((s) => s.name === 'prompt-manager:temporary:dyn')
   assert.ok(section)
   assert.equal(section.text, 'REPLACEMENT')
 }))
@@ -184,7 +184,7 @@ test('#5 后注入工作区条目的 replace 同样生效', () => withHarness(as
   const agent = harness.createAgent('s1', 'D:/work')
   await harness.callTool({ action: 'override.set', name: 'prompt-manager:hot', mode: 'replace', text: 'HOT REPLACED', sessionId: 's1' })
 
-  const section = agent.assemble(fixture()).sections.find((s) => s.name === 'prompt-manager:hot')
+  const section = (await agent.assemble(fixture())).sections.find((s) => s.name === 'prompt-manager:hot')
   assert.ok(section)
   assert.equal(section.text, 'HOT REPLACED')
 }))
@@ -206,11 +206,11 @@ test('#6 动态条目与覆盖文本同样不触发插值', () => withHarness(as
   const agent = harness.createAgent('s1')
   await harness.callTool({ action: 'temp.add', id: 'dyn', text: 'temp {{user_input}} literal', sessionId: 's1' })
 
-  const dynamic = agent.assemble(fixture()).sections.find((s) => s.name === 'prompt-manager:temporary:dyn')
+  const dynamic = (await agent.assemble(fixture())).sections.find((s) => s.name === 'prompt-manager:temporary:dyn')
   assert.equal(dynamic.interpolate, false)
 
   await harness.callTool({ action: 'override.set', name: 'harness:identity', mode: 'replace', text: 'over {{x}} text', sessionId: 's1' })
-  const replaced = agent.assemble(fixture()).sections.find((s) => s.name === 'harness:identity')
+  const replaced = (await agent.assemble(fixture())).sections.find((s) => s.name === 'harness:identity')
   assert.equal(replaced.text, 'over {{x}} text')
   assert.equal(replaced.interpolate, false)
 }))
@@ -221,14 +221,14 @@ test('#8 全部恢复后重新启用，不会复活已清除的旧规则', () =>
   await harness.callTool({ action: 'override.set', name: 'harness:identity', mode: 'replace', text: 'GLOBAL' })
   const agent = harness.createAgent('s1')
   // 会话建立时冻结了 GLOBAL 基线
-  assert.equal(agent.assemble(fixture()).sections.find((s) => s.name === 'harness:identity').text, 'GLOBAL')
+  assert.equal((await agent.assemble(fixture())).sections.find((s) => s.name === 'harness:identity').text, 'GLOBAL')
 
   await harness.callTool({ action: 'override.reset' })
-  assert.equal(agent.assemble(fixture()).sections.find((s) => s.name === 'harness:identity').text, 'base identity')
+  assert.equal((await agent.assemble(fixture())).sections.find((s) => s.name === 'harness:identity').text, 'base identity')
 
   await harness.callTool({ action: 'override.toggle', enabled: true })
   assert.equal(
-    agent.assemble(fixture()).sections.find((s) => s.name === 'harness:identity').text,
+    (await agent.assemble(fixture())).sections.find((s) => s.name === 'harness:identity').text,
     'base identity',
     '重新打开总开关不应把冻结的旧基线带回来',
   )
@@ -247,7 +247,7 @@ test('#10 卸载时释放路由，不残留旧 handler', () => withHarness(async
 test('#11 文档变更不会摘掉 assemble hook，动态层仍在', () => withHarness(async (harness) => {
   const agent = harness.createAgent('s1')
   await harness.callTool({ action: 'temp.add', id: 'keep', text: 'DYN KEEP', sessionId: 's1' })
-  const before = agent.assemble(fixture()).sections.find((s) => s.name === 'prompt-manager:temporary:keep')
+  const before = (await agent.assemble(fixture())).sections.find((s) => s.name === 'prompt-manager:temporary:keep')
   assert.ok(before, '前置：临时条目应当通过 assemble hook 注入')
 
   // 下面这一步会走 refreshRunningAgents → syncAgentSections。
@@ -256,7 +256,7 @@ test('#11 文档变更不会摘掉 assemble hook，动态层仍在', () => withH
   // 就此永久消失（面板还照旧显示旧快照，看着像生效了）。
   await harness.callTool({ action: 'override.set', name: 'harness:identity', mode: 'disable' })
 
-  const after = agent.assemble(fixture()).sections.find((s) => s.name === 'prompt-manager:temporary:keep')
+  const after = (await agent.assemble(fixture())).sections.find((s) => s.name === 'prompt-manager:temporary:keep')
   assert.ok(after, '同步静态 section 时不能连带摘掉 assemble hook')
 }))
 
@@ -265,6 +265,32 @@ test('#11 卸载后路由与工具都被释放', () => withHarness(async (harnes
   assert.ok(harness.getTool(), '注册后应有工具')
   harness.emit('dispose')
   assert.equal(harness.getRoute(), null, '卸载后路由必须摘掉，否则它一直应答且没有鉴权')
+}))
+
+test('#12 waterfall 契约：不调 next 会吞掉后面的 listener', () => withHarness(async (harness) => {
+  const agent = harness.createAgent('s1')
+  // 在插件 hook **之后**再挂一个 listener，模拟别的插件也想加工装配。插件 hook
+  // 先注册，在 waterfall 里排在前面；它不调 next 的话这个 listener 永远不会执行
+  // —— 而插件原先正是这么写的（签名只声明 assembly、直接 return）。
+  let downstreamRan = false
+  agent.agent.ctx.on('system-prompt/assemble', (assembly, context, next) => {
+    downstreamRan = true
+    return next()
+  })
+
+  await agent.assemble(fixture())
+  assert.equal(downstreamRan, true, '插件的 assemble hook 必须调 next()，否则会独占整条装配链')
+}))
+
+test('#12 下游 listener 的追加能保留到最终装配', () => withHarness(async (harness) => {
+  const agent = harness.createAgent('s1')
+  agent.agent.ctx.on('system-prompt/assemble', async (assembly, context, next) => {
+    const result = await next()
+    return { ...result, sections: [...result.sections, { name: 'from:downstream', text: 'tail', interpolate: false }] }
+  })
+
+  const names = (await agent.assemble(fixture())).sections.map((s) => s.name)
+  assert.ok(names.includes('from:downstream'), '下游的追加应当保留在最终装配里')
 }))
 
 // ------------------------------------------------ 9 快照脚本（静态检查）

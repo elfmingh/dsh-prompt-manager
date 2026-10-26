@@ -14,7 +14,7 @@ test('disable 内置段落：装配结果里移除', async (t) => {
   assert.deepEqual(h.readStore().overrides.sections['harness:identity'], { mode: 'disable' })
 
   const agent = h.createAgent('session-a')
-  const result = agent.assemble(fixture())
+  const result = (await agent.assemble(fixture()))
   assert.deepEqual(names(result.sections), ['plan:policy', 'team:policy'])
 })
 
@@ -25,7 +25,7 @@ test('replace 内置段落：文本被替换、顺序保留', async (t) => {
   await h.callTool({ action: 'override.set', name: 'plan:policy', mode: 'replace', text: 'REPLACED POLICY' })
 
   const agent = h.createAgent('session-a')
-  const result = agent.assemble(fixture())
+  const result = (await agent.assemble(fixture()))
   const replaced = result.sections.find((section) => section.name === 'plan:policy')
   assert.equal(replaced.text, 'REPLACED POLICY')
   assert.deepEqual(names(result.sections), names(fixture().sections), '只换文本，不改顺序')
@@ -46,7 +46,7 @@ test('禁用后装配快照仍保留原始段落（可重新开启）', async (t
 
   await h.callTool({ action: 'override.set', name: 'harness:identity', mode: 'disable' })
   const agent = h.createAgent('session-a')
-  const assembled = agent.assemble(fixture())
+  const assembled = (await agent.assemble(fixture()))
   assert.equal(names(assembled.sections).includes('harness:identity'), false)
 
   const response = await h.callHttp('/prompt-manager/api?view=assembled&sessionId=session-a')
@@ -56,7 +56,7 @@ test('禁用后装配快照仍保留原始段落（可重新开启）', async (t
 
   // 面板据此把它重新打开：会话页写会话级 enable，推翻全局基线里的 disable。
   await h.callTool({ action: 'override.set', name: 'harness:identity', mode: 'enable', sessionId: 'session-a' })
-  const reopened = agent.assemble(fixture())
+  const reopened = (await agent.assemble(fixture()))
   assert.equal(names(reopened.sections).includes('harness:identity'), true)
 })
 
@@ -65,16 +65,16 @@ test('主页改动只对新会话生效，运行中的会话不受影响', async
   t.after(h.cleanup)
 
   const running = h.createAgent('session-running')
-  assert.equal(names(running.assemble(fixture()).sections).includes('harness:identity'), true)
+  assert.equal(names((await running.assemble(fixture())).sections).includes('harness:identity'), true)
 
   // 中途在主页禁用：运行中的会话不该被动到（否则缓存前缀整段失效）。
   await h.callTool({ action: 'override.set', name: 'harness:identity', mode: 'disable' })
-  const stillThere = running.assemble(fixture())
+  const stillThere = (await running.assemble(fixture()))
   assert.equal(names(stillThere.sections).includes('harness:identity'), true, '运行中的会话保持原样')
 
   // 新建的会话才拿到新规则。
   const fresh = h.createAgent('session-fresh')
-  assert.equal(names(fresh.assemble(fixture()).sections).includes('harness:identity'), false)
+  assert.equal(names((await fresh.assemble(fixture())).sections).includes('harness:identity'), false)
 })
 
 test('会话页的 section 改动立即生效且只影响本会话', async (t) => {
@@ -86,8 +86,8 @@ test('会话页的 section 改动立即生效且只影响本会话', async (t) =
 
   await h.callTool({ action: 'override.set', name: 'plan:policy', mode: 'disable', sessionId: 'session-a' })
 
-  assert.equal(names(a.assemble(fixture()).sections).includes('plan:policy'), false, '立即生效')
-  assert.equal(names(b.assemble(fixture()).sections).includes('plan:policy'), true, '另一个会话不受影响')
+  assert.equal(names((await a.assemble(fixture())).sections).includes('plan:policy'), false, '立即生效')
+  assert.equal(names((await b.assemble(fixture())).sections).includes('plan:policy'), true, '另一个会话不受影响')
 
   const store = h.readStore()
   assert.deepEqual(store.overrides.sessionSections, { 'session-a': { 'plan:policy': { mode: 'disable' } } })
@@ -100,11 +100,11 @@ test('总开关立即生效，不受基线冻结影响', async (t) => {
 
   await h.callTool({ action: 'override.set', name: 'harness:identity', mode: 'disable' })
   const agent = h.createAgent('session-a')
-  assert.equal(names(agent.assemble(fixture()).sections).includes('harness:identity'), false)
+  assert.equal(names((await agent.assemble(fixture())).sections).includes('harness:identity'), false)
 
   // 总开关是全局刹车，必须立刻有效。
   await h.callTool({ action: 'override.toggle', enabled: false })
-  const off = agent.assemble(fixture())
+  const off = (await agent.assemble(fixture()))
   assert.equal(names(off.sections).includes('harness:identity'), true)
 })
 
@@ -116,8 +116,8 @@ test('全局 context 禁用影响所有会话', async (t) => {
 
   const a = h.createAgent('session-a')
   const b = h.createAgent('session-b')
-  assert.equal(names(a.assemble(fixture()).contexts).includes('app:web-surface'), false)
-  assert.equal(names(b.assemble(fixture()).contexts).includes('app:web-surface'), false)
+  assert.equal(names((await a.assemble(fixture())).contexts).includes('app:web-surface'), false)
+  assert.equal(names((await b.assemble(fixture())).contexts).includes('app:web-surface'), false)
 })
 
 test('context 按会话隔离：只影响目标会话', async (t) => {
@@ -141,8 +141,8 @@ test('context 按会话隔离：只影响目标会话', async (t) => {
   })
   assert.deepEqual(store.overrides.contexts, {}, '不应写进全局规则')
 
-  assert.equal(names(a.assemble(fixture()).contexts).includes('app:web-surface'), false)
-  assert.equal(names(b.assemble(fixture()).contexts).includes('app:web-surface'), true, '其他会话不受影响')
+  assert.equal(names((await a.assemble(fixture())).contexts).includes('app:web-surface'), false)
+  assert.equal(names((await b.assemble(fixture())).contexts).includes('app:web-surface'), true, '其他会话不受影响')
 })
 
 test('会话规则优先于全局规则', async (t) => {
@@ -165,8 +165,8 @@ test('会话规则优先于全局规则', async (t) => {
   })
 
   const textOf = (assembly) => assembly.contexts.find((item) => item.name === 'sandbox:policy')?.text
-  assert.equal(textOf(a.assemble(fixture())), 'SESSION')
-  assert.equal(textOf(b.assemble(fixture())), 'GLOBAL')
+  assert.equal(textOf((await a.assemble(fixture()))), 'SESSION')
+  assert.equal(textOf((await b.assemble(fixture()))), 'GLOBAL')
 })
 
 test('会话级 clear 只清本会话并归档归属', async (t) => {
@@ -201,7 +201,7 @@ test('clear 归档覆盖文本，restore 可重新装上', async (t) => {
   assert.equal(store.overrides.saved[0].layer, 'sections')
 
   const agent = h.createAgent('session-a')
-  assert.equal(names(agent.assemble(fixture()).sections).includes('harness:identity'), true, '恢复默认后段落回来了')
+  assert.equal(names((await agent.assemble(fixture())).sections).includes('harness:identity'), true, '恢复默认后段落回来了')
 
   await h.callTool({ action: 'override.restore', id: store.overrides.saved[0].id })
   store = h.readStore()
@@ -210,7 +210,7 @@ test('clear 归档覆盖文本，restore 可重新装上', async (t) => {
 
   // 全局规则只对新会话生效，所以用新会话验证装回效果。
   const fresh = h.createAgent('session-fresh')
-  const restored = fresh.assemble(fixture())
+  const restored = (await fresh.assemble(fixture()))
   assert.equal(restored.sections.find((section) => section.name === 'harness:identity').text, 'REPLACED IDENTITY')
 })
 
@@ -263,7 +263,7 @@ test('reset 清空全部规则并归档覆盖文本', async (t) => {
   assert.equal(store.overrides.saved.length, 2)
 
   const agent = h.createAgent('session-a')
-  const result = agent.assemble(fixture())
+  const result = (await agent.assemble(fixture()))
   assert.deepEqual(names(result.sections), names(fixture().sections))
 })
 
@@ -288,7 +288,7 @@ test('总开关关闭时规则不生效但保留', async (t) => {
   await h.callTool({ action: 'override.toggle', enabled: false })
 
   const agent = h.createAgent('session-a')
-  const result = agent.assemble(fixture())
+  const result = (await agent.assemble(fixture()))
   assert.equal(names(result.sections).includes('harness:identity'), true, '总开关关 → 规则不生效')
 
   const store = h.readStore()
@@ -303,7 +303,7 @@ test('assembled 端点返回合并后的 contextRules', async (t) => {
   await h.callTool({ action: 'override.set', name: 'app:web-surface', mode: 'disable', layer: 'context', sessionId: 'session-a' })
 
   const agent = h.createAgent('session-a')
-  agent.assemble(fixture())
+  await agent.assemble(fixture())
 
   const response = await h.callHttp('/prompt-manager/api?view=assembled&sessionId=session-a')
   assert.equal(response.body.ok, true)
@@ -315,7 +315,7 @@ test('assembled 端点返回合并后的 contextRules', async (t) => {
 
   // 其他会话只看得到全局规则。
   const other = h.createAgent('session-b')
-  other.assemble(fixture())
+  await other.assemble(fixture())
   const otherResponse = await h.callHttp('/prompt-manager/api?view=assembled&sessionId=session-b')
   assert.deepEqual(Object.keys(otherResponse.body.contextRules), ['sandbox:policy'])
 })
@@ -326,6 +326,6 @@ test('工具列表只读：override 不影响 tools', async (t) => {
 
   await h.callTool({ action: 'override.set', name: 'harness:identity', mode: 'disable' })
   const agent = h.createAgent('session-a')
-  const result = agent.assemble(fixture())
+  const result = (await agent.assemble(fixture()))
   assert.deepEqual(names(result.tools), ['shell', 'read'])
 })

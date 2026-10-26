@@ -51,6 +51,10 @@ export async function createHarness() {
     tools: {
       register(definition) {
         tool = definition
+        // 真宿主返回卸装函数。不返回的话「卸载后工具还在列表里」测不出来。
+        return () => {
+          if (tool === definition) tool = null
+        }
       },
     },
     systemPrompt: {
@@ -144,19 +148,27 @@ export async function createHarness() {
         systemPrompt: {
           section(spec) {
             staticSections.push(spec)
-            return () => {}
+            // 真宿主返回的 disposer 会把这个 section 摘掉。返回空函数会让
+            // 「静态段落没清理 / 重复注册」这类问题在测试里完全隐形。
+            return () => {
+              const index = staticSections.indexOf(spec)
+              if (index >= 0) staticSections.splice(index, 1)
+            }
           },
           context() {
             return () => {}
           },
         },
         on(event, handler) {
-          handlers.set(event, handler)
-          // 真宿主（Cordis）的 ctx.on 返回 disposer，调用后监听就摘掉。
-          // 这里必须照做，否则「hook 被 sync 误摘」这类 bug 在测试里永远看不见：
-          // 返回 undefined 时插件侧记不到 disposer，也就无从被摘下。
+          // 真 Cordis 一个事件可以有多个 listener；用 Map<event, handler> 会让
+          // 后挂的覆盖先挂的，重复挂 hook、监听顺序、waterfall 组合全都测不出来。
+          const list = handlers.get(event) ?? []
+          list.push(handler)
+          handlers.set(event, list)
           return () => {
-            if (handlers.get(event) === handler) handlers.delete(event)
+            const current = handlers.get(event) ?? []
+            const index = current.indexOf(handler)
+            if (index >= 0) current.splice(index, 1)
           }
         },
       },
@@ -166,9 +178,19 @@ export async function createHarness() {
       sessionId,
       agent,
       staticSections,
-      assemble(assembly) {
-        const handler = handlers.get('system-prompt/assemble')
-        return handler ? handler(assembly) : assembly
+      /**
+       * 按 Cordis waterfall 语义装配：第 i 个 listener 的 `next()` 调第 i+1 个，
+       * 最后由返回值决定结果。只有这样才测得出「listener 不调 next 就阻断后面」
+       * 这类契约 bug —— 旧实现直接调单个 handler，等于替插件掩盖了它。
+       */
+      async assemble(assembly) {
+        const list = handlers.get('system-prompt/assemble') ?? []
+        const dispatch = (index, current) => {
+          const handler = list[index]
+          if (!handler) return current
+          return Promise.resolve(handler(current, {}, () => dispatch(index + 1, current)))
+        }
+        return dispatch(0, assembly)
       },
     }
   }

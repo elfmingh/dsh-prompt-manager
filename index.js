@@ -83,10 +83,46 @@ function registry(scope) {
   const key = Symbol.for(`${DISPOSER_REGISTRY_PREFIX}${scope}`)
   let entry = globalThis[key]
   if (!entry) {
-    entry = { current: null, all: new Set(), state: null, scope }
+    entry = { current: null, all: new Set(), state: null, lastDocument: null, scope }
     globalThis[key] = entry
   }
   return entry
+}
+
+/**
+ * 0.2.4 及更早用的是不带实例后缀的固定 Symbol 键。
+ *
+ * 从那些版本热重载上来时，旧实例的 route / tool / watcher 清理函数还躺在旧键里，
+ * 而新实例只认带后缀的键 —— 那群清理函数从此没有人调用，等于永久泄漏：路由一直
+ * 应答、watcher 一直在跑、同一路径再注册就抛 duplicate route。这里把它们执行一遍。
+ */
+const LEGACY_DISPOSER_REGISTRY = Symbol.for('vertixara.dsh-prompt-manager/disposers')
+
+function drainLegacyRegistry() {
+  const legacy = globalThis[LEGACY_DISPOSER_REGISTRY]
+  if (!legacy || typeof legacy !== 'object') return
+  try {
+    for (const list of Array.isArray(legacy.all) ? legacy.all : []) {
+      while (list.length) {
+        const dispose = list.pop()
+        try {
+          if (typeof dispose === 'function') dispose()
+        } catch {
+          /* 清理失败不应阻断后续清理 */
+        }
+      }
+    }
+    legacy.all = new Set()
+    legacy.current = null
+    legacy.state = null
+  } catch {
+    /* 结构对不上就算了，不能因为一次迁移失败让插件起不来 */
+  }
+  try {
+    delete globalThis[LEGACY_DISPOSER_REGISTRY]
+  } catch {
+    /* 删不掉也无所谓，下一次 apply 会再清一遍 */
+  }
 }
 
 function trackDisposer(scope, dispose) {
@@ -113,8 +149,14 @@ function disposeAll(scope) {
   }
   entry.all.clear()
   entry.current = null
-  // 顺手把 store 引用也置空：卸载之后还挂在 agent 上的旧 hook 会经 currentState
-  // 回落到它自己闭包里那份 state，而不是继续读一个永远不会再更新的死实例文档。
+  // 把最后一份有效文档留下来再清 state。
+  //
+  // 卸载摘不掉已经挂在 agent 上的旧 hook，它下次装配还会走 currentState。如果这时
+  // 只剩「回落到自己闭包里那份 state」一条路，回落到的就是**更旧**的文档：实例 A
+  // 建 agent → 重载成 B → B 删掉某条临时提示词 → 卸载 B，旧 hook 回落到 A 的文档，
+  // 那条已经删掉的提示词就复活了。保留 B 的文档做兜底，语义是「插件停了，保持在
+  // 它停之前的最后状态」，而不是「倒退到更早的某次装配」。
+  if (entry.state) entry.lastDocument = entry.state
   entry.state = null
 }
 
@@ -128,7 +170,10 @@ function disposeAll(scope) {
  */
 function currentState(scope, fallback) {
   const entry = registry(scope)
-  return entry.state ?? fallback
+  // 顺序：本实例的 state → 上一个实例卸载时留下的最后一份文档 → 调用方闭包里的
+  // 那份。中间的 lastDocument 不能省：没有它，卸载后旧 hook 会一路回落到更早的
+  // 实例，把已经删掉的内容重新装配回来。
+  return entry.state ?? entry.lastDocument ?? fallback
 }
 
 /**
@@ -198,18 +243,41 @@ function agentStateOf(agent) {
     // 只读 Proxy 的 getter 会抛，别让它冒到 agent/created 的 catch 里变成莫名一条。
     return null
   }
+  // 认的只有「带 sectionDisposers 数组」的新结构。0.2.4 的旧结构是
+  // { cleanups: [], hookAttached } —— 直接当新的用会在 .sectionDisposers.splice
+  // 上抛错，而后面的清理逻辑早就按新结构写了。
+  if (state && Array.isArray(state.sectionDisposers)) return state
   if (!state) {
     // section 的 disposers 和 assemble hook 的 disposer **必须分开放**。
     // 放同一个数组里的话，任何一次文档变更触发的 syncAgentSections 会把 hook
     // 一起 splice 掉，而 hookAttached 仍是 true、不会重挂 —— 那个会话的动态层
     // 就永久消失了。这是 bfcaaeb 引入的回归，之前两者是分池的。
     state = { sectionDisposers: [], hookDispose: null, hookAttached: false }
+  } else {
+    // 从 0.2.4 升级上来：旧 cleanups 里**混着** hook 的 disposer（0.2.4 是
+    // `state.cleanups.push(disposeHook)` 直接塞进去的）。不能把它们当成
+    // sectionDisposers 继承 —— 那等于把 hook 的摘除权交给 syncAgentSections，
+    // 一改文档就重演同一个 bug。全部执行掉：它们摘的正是旧实例留下的 section
+    // 和旧 hook，然后按「什么都没挂」重新来过。
     try {
-      agent[AGENT_STATE] = state
+      for (const dispose of Array.isArray(state.cleanups) ? state.cleanups.splice(0) : []) {
+        try {
+          if (typeof dispose === 'function') dispose()
+        } catch {
+          /* 旧 disposer 抛错不该阻断迁移 */
+        }
+      }
+      if (typeof state.hookDispose === 'function') state.hookDispose()
     } catch {
-      // agent 被冻结：拿不到状态就不挂，宁可不生效也不要抛错。
-      return null
+      /* 同上 */
     }
+    state = { sectionDisposers: [], hookDispose: null, hookAttached: false }
+  }
+  try {
+    agent[AGENT_STATE] = state
+  } catch {
+    // agent 被冻结：拿不到状态就不挂，宁可不生效也不要抛错。
+    return null
   }
   return state
 }
@@ -246,6 +314,9 @@ export function apply(ctx, config = {}) {
   const storeFile = (config && config.storeFile) || join(dshHome(), 'prompt-manager.json')
   // 上一次 apply 的残留先摘掉，否则注册同一路径会抛 duplicate route。
   disposeAll(storeFile)
+  // 从 0.2.4 热重载上来时，旧实例的清理函数在另一张（无后缀的）表里，只清本实例
+  // 的槽会把它们漏掉。见 drainLegacyRegistry。
+  drainLegacyRegistry()
   trackDisposer(storeFile, () => {}) // 建立本次 apply 的列表，后续 trackDisposer 归到这里
   // 清理钩子必须挂在开头，而不是 apply 末尾：后面任何一步抛错，末尾那行就执行不到，
   // 这一次 apply 注册的东西就会永久留在宿主里。
@@ -548,39 +619,62 @@ export function apply(ctx, config = {}) {
   // -------------------------------------------------------------- store i/o
 
   async function loadStore() {
+    // 读、解析、归一化拆成三段 try。只有「解析」失败才说明文件内容坏了；
+    // 早先三者共用一个 catch，于是 EACCES / EIO 这类读取错误也会落进隔离分支，
+    // 把一份刚刚保存成功的配置从正式文件上 rename 走 —— 读一次失败就能毁掉
+    // 正常运行的配置，这比它想防的问题严重得多。
+    let text
     try {
-      const text = await readFile(storeFile, 'utf8')
-      const parsed = text.trim() ? JSON.parse(text) : null
-      const legacy = !parsed || Number(parsed?.version ?? 1) < STORE_VERSION
-      const document = normalizeDocument(parsed)
-      state.document = document
-      if (legacy) {
-        try {
-          await writeFile(storeFile, `${JSON.stringify(document, null, 2)}\n`, 'utf8')
-          diag('migrated-to-v2')
-        } catch (error) {
-          diag(`migrate-write-failed ${error?.message ?? error}`)
-        }
-      }
-      return document
+      text = await readFile(storeFile, 'utf8')
     } catch (error) {
       if (error?.code === 'ENOENT') {
         state.document = emptyDocument()
         return state.document
       }
-      // 解析失败时不能静默退回空文档：插件会带着空配置继续跑，用户下一次点任何
-      // 东西都拿空文档整份写回，把那个坏掉、但可能还抢救得出来的文件彻底覆盖。
-      // 先把原文件挪到一边留证据，再退回空文档。
+      // 读不到不等于内容坏了。没有证据就不许动用户的数据：保留最后一次有效
+      // 文档继续装配（比退回空配置安全），把失败留在日志里。
+      log(`load-failed(io) code=${error?.code ?? '-'} ${error?.message ?? error}`)
+      return state.document
+    }
+
+    let parsed
+    try {
+      parsed = text.trim() ? JSON.parse(text) : null
+    } catch (error) {
+      // 到这里才是真的解析不了。不能静默退回空文档：插件会带着空配置继续跑，
+      // 用户下一次点任何东西都拿空文档整份写回，把那个坏掉、但可能还抢救得
+      // 出来的文件彻底覆盖。先把原文件挪到一边留证据，再退回空文档。
       const backup = `${storeFile}.corrupt-${Date.now().toString(36)}`
       try {
         await rename(storeFile, backup)
-        log(`load-failed ${error?.message ?? error}；原文件已保留为 ${backup}`)
+        log(`store-corrupt ${error?.message ?? error}；原文件已保留为 ${backup}`)
       } catch (moveError) {
-        log(`load-failed ${error?.message ?? error}；隔离原文件失败 ${moveError?.message ?? moveError}`)
+        log(`store-corrupt ${error?.message ?? error}；隔离原文件失败 ${moveError?.message ?? moveError}`)
       }
       state.document = emptyDocument()
       return state.document
     }
+
+    let document
+    try {
+      document = normalizeDocument(parsed)
+    } catch (error) {
+      // 归一化是纯函数，它抛错说明代码有问题，不是文件有问题 —— 同样不许动数据。
+      log(`store-normalize-failed ${error?.message ?? error}`)
+      return state.document
+    }
+    state.document = document
+    if (!parsed || Number(parsed?.version ?? 1) < STORE_VERSION) {
+      try {
+        // 走 saveStore 而不是裸 writeFile：迁移同样是「覆盖用户的正式文件」，
+        // 必须有原子写与 rename 重试。
+        await saveStore(document)
+        diag('migrated-to-v2')
+      } catch (error) {
+        diag(`migrate-write-failed ${error?.message ?? error}`)
+      }
+    }
+    return state.document
   }
 
   async function saveStore(document) {
@@ -622,15 +716,39 @@ export function apply(ctx, config = {}) {
 
   // ------------------------------------------------------------- resolution
 
-  function workspaceEntries() {
-    return Object.entries(state.document.applications.workspaces)
+  /**
+ * 复制一个工作区配置，连同它的三个数组。
+ *
+ * 这些数组必须复制：`{ ...document.applications.workspaces }` 只是浅拷贝外层对象，
+ * 拿到的 `target` 仍然指向当前文档里的那个对象，`target.enabled.push(...)` 改的是
+ * **已经发布的内存文档**。saveStore 失败时没有回滚 —— 结果是 HTTP 返回 500、磁盘
+ * 还是旧的，但内存已经改了，下一次装配就按新规则走，和界面显示完全对不上。
+ */
+function cloneWorkspace(workspace) {
+  const source = workspace ?? { enabled: [], disabled: [], default: [] }
+  return {
+    ...source,
+    enabled: [...(source.enabled ?? [])],
+    disabled: [...(source.disabled ?? [])],
+    default: [...(source.default ?? [])],
+  }
+}
+
+function workspaceEntries(document = state.document) {
+    return Object.entries(document.applications.workspaces)
   }
 
-  function matchWorkspaceKey(cwd) {
+  /**
+   * @param cwd 会话的工作目录
+   * @param document 要匹配的那份文档。装配时必须把当前这份传进来：默认参数读的是
+   *   `state.document`，而 hook 可能属于上一个实例（热重载摘不掉），闭包里的
+   *   state 是旧文档 —— 那就是「规则用新的、条目用旧的」老问题换了个位置复发。
+   */
+  function matchWorkspaceKey(cwd, document = state.document) {
     const current = normalizePathValue(cwd)
     if (!current) return ''
     let best = ''
-    for (const [key] of workspaceEntries()) {
+    for (const [key] of workspaceEntries(document)) {
       if (!key) continue
       if (current === key || current.startsWith(`${key}/`)) {
         if (key.length > best.length) best = key
@@ -715,7 +833,7 @@ export function apply(ctx, config = {}) {
    */
   function resolveStaticItems(facts) {
     const document = state.document
-    const workspaceKey = matchWorkspaceKey(facts?.cwd)
+    const workspaceKey = matchWorkspaceKey(facts?.cwd, document)
     const workspace = workspaceKey ? document.applications.workspaces[workspaceKey] : undefined
     const disabled = new Set(workspace?.disabled ?? [])
     const hot = workspace?.hotReload === true
@@ -744,7 +862,7 @@ export function apply(ctx, config = {}) {
    * 「新文档已经删掉的临时条目还在被注入，新 replace 规则作用在旧文本上」。
    */
   function resolveDynamicItems(facts, document = state.document) {
-    const workspaceKey = matchWorkspaceKey(facts?.cwd)
+    const workspaceKey = matchWorkspaceKey(facts?.cwd, document)
     const workspace = workspaceKey ? document.applications.workspaces[workspaceKey] : undefined
     const disabled = new Set(workspace?.disabled ?? [])
     const lineage = sessionLineage(facts?.sessionId)
@@ -860,6 +978,12 @@ export function apply(ctx, config = {}) {
       }
     }
     diag(`agent-sections sid=${sessionId || '-'} cwd=${facts.cwd || '-'} items=${items.length}`)
+
+    // 从 0.2.4 迁移过来的 agent：agentStateOf 已经把旧 hook 摘掉了（旧 hook 读的是
+    // 无后缀的固定键，留着也读不到新实例的文档），但摘完没有任何地方重挂它 ——
+    // 已存在的会话不会再来一次 agent/created。漏了这一步，升级那一刻还活着的会话
+    // 动态层就永久消失，只能靠重开会话才恢复。
+    if (!agentState.hookAttached) attachAssembleHook(agent)
   }
 
   /**
@@ -907,8 +1031,16 @@ export function apply(ctx, config = {}) {
       freezeBaseline(sessionId)
     }
     try {
-      const disposeHook = agent.ctx.on('system-prompt/assemble', (assembly) => {
+      const disposeHook = agent.ctx.on('system-prompt/assemble', async (assembly, context, next) => {
         try {
+          // waterfall 契约：不调 next 就等于独占了整条装配链，排在我们后面的
+          // listener 一个都不会执行。这个 hook 原先只声明 (assembly) 一个参数、
+          // 从不调 next —— 现在没出事只是因为还没有别的插件监听这个事件。
+          //
+          // 顺序选「先 next 再加工」：用户的覆盖规则是最终裁决，必须作用在下游的
+          // 结果之上；反过来先改再 next，下游就能把它们盖掉。宿主契约里 `assembly`
+          // 虽然允许原地修改，但返回值才是权威的，所以这里一律构造新对象。
+          const downstream = (await next()) ?? assembly
           // 现取最新 store：这个 hook 可能属于上一个 apply 实例（热重载摘不掉它），
           // 读闭包里的 state 会永远停在重载前那份文档上。整段装配必须统一用这一份，
           // 不能规则取新的、条目取旧的。
@@ -935,9 +1067,9 @@ export function apply(ctx, config = {}) {
             name: String(entry?.name ?? ''),
             text: typeof entry?.text === 'string' ? entry.text : String(entry?.text ?? ''),
           })
-          const rawSections = (Array.isArray(assembly?.sections) ? assembly.sections : []).map(toEntry)
-          const rawContexts = (Array.isArray(assembly?.contexts) ? assembly.contexts : []).map(toEntry)
-          const rawTools = (assembly?.tools ?? []).map((tool) => ({
+          const rawSections = (Array.isArray(downstream?.sections) ? downstream.sections : []).map(toEntry)
+          const rawContexts = (Array.isArray(downstream?.contexts) ? downstream.contexts : []).map(toEntry)
+          const rawTools = (downstream?.tools ?? []).map((tool) => ({
             name: String(tool?.name ?? ''),
             description: String(tool?.description ?? ''),
             parameterKeys: Object.keys(tool?.parameters?.properties ?? {}),
@@ -945,12 +1077,12 @@ export function apply(ctx, config = {}) {
 
           if (!hasRules && !items.length) {
             recordSnapshot(sessionId, { sections: rawSections, contexts: rawContexts, tools: rawTools, injected: [] })
-            return assembly
+            return downstream
           }
 
           // 1) 内置段落：disable 直接移除，replace 换文本。
           const sections = []
-          for (const section of Array.isArray(assembly?.sections) ? assembly.sections : []) {
+          for (const section of Array.isArray(downstream?.sections) ? downstream.sections : []) {
             const rule = sectionRules[section?.name]
             if (rule?.mode === 'disable') continue
             if (rule?.mode === 'replace') {
@@ -963,14 +1095,14 @@ export function apply(ctx, config = {}) {
 
           // 2) contexts 同样处理；required 的 context 若被移除，由框架决定是否恢复。
           const contexts = []
-          for (const context of Array.isArray(assembly?.contexts) ? assembly.contexts : []) {
-            const rule = contextRules[context?.name]
+          for (const entry of Array.isArray(downstream?.contexts) ? downstream.contexts : []) {
+            const rule = contextRules[entry?.name]
             if (rule?.mode === 'disable') continue
             if (rule?.mode === 'replace') {
-              contexts.push({ ...context, text: rule.text, interpolate: false })
+              contexts.push({ ...entry, text: rule.text, interpolate: false })
               continue
             }
-            contexts.push(context)
+            contexts.push(entry)
           }
 
           // 3) 再追加动态层；已被 disable 的段落不再追加回来。
@@ -994,7 +1126,7 @@ export function apply(ctx, config = {}) {
             tools: rawTools,
             injected: allExtras,
           })
-          return { ...assembly, sections: [...sections, ...extras], contexts }
+          return { ...downstream, sections: [...sections, ...extras], contexts }
         } catch (error) {
           log(`assemble-hook-failed ${error?.message ?? error}`)
           return assembly
@@ -1238,7 +1370,7 @@ export function apply(ctx, config = {}) {
         const key = normalizePathValue(args?.workspacePath)
         if (!key) return 'error: scope=workspace 需要 workspacePath'
         const workspaces = { ...document.applications.workspaces }
-        const target = workspaces[key] ?? { enabled: [], disabled: [], default: [] }
+        const target = cloneWorkspace(workspaces[key])
         target.enabled = target.enabled.filter((value) => value !== id)
         target.disabled = target.disabled.filter((value) => value !== id)
         if (enabled) target.enabled.push(id)
@@ -1256,7 +1388,7 @@ export function apply(ctx, config = {}) {
         if (!id || !document.entries.some((entry) => entry.id === id)) return `error: 档案不存在 ${id}`
         if (!key) return 'error: apply.default 需要 workspacePath'
         const workspaces = { ...document.applications.workspaces }
-        const target = workspaces[key] ?? { enabled: [], disabled: [], default: [] }
+        const target = cloneWorkspace(workspaces[key])
         if (args?.isDefault === false) {
           target.default = target.default.filter((value) => value !== id)
         } else {
@@ -1276,7 +1408,7 @@ export function apply(ctx, config = {}) {
         const key = normalizePathValue(args?.workspacePath)
         if (!key) return 'error: apply.hotReload 需要 workspacePath'
         const workspaces = { ...document.applications.workspaces }
-        const target = workspaces[key] ?? { enabled: [], disabled: [], default: [], hotReload: false }
+        const target = cloneWorkspace(workspaces[key])
         target.hotReload = args?.enabled !== false
         workspaces[key] = target
         await saveStore({ ...document, applications: { ...document.applications, workspaces } })
@@ -1881,7 +2013,9 @@ export function apply(ctx, config = {}) {
   // 最后才把这份 store 登记给 globalThis。上面任何一步抛错时，registry 仍然指向上
   // 一个实例的文档 —— 那份虽然旧，但至少完整。如果早早就换成这次刚建的空壳，一次
   // 半途失败的 apply 会让所有还挂着的旧 hook 突然读到空文档，规则全部失效。
-  registry(storeFile).state = state
+  const live = registry(storeFile)
+  live.state = state
+  live.lastDocument = state
 
   diag('apply-ready v2')
 }
