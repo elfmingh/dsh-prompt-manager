@@ -178,6 +178,12 @@ export async function createHarness() {
       sessionId,
       agent,
       staticSections,
+      /** 这个 agent 上某个事件挂了多少个 listener —— assemble hook 就挂在这里。 */
+      listenerCount: (event) => (handlers.get(event) ?? []).length,
+      /** 模拟「这个注册已经被摘掉了」。0.2.4 的 hook disposer 存在 cleanups 里。 */
+      dropListeners: (event) => {
+        handlers.delete(event)
+      },
       /**
        * 按 Cordis waterfall 语义装配：第 i 个 listener 的 `next()` 调第 i+1 个，
        * 最后由返回值决定结果。只有这样才测得出「listener 不调 next 就阻断后面」
@@ -229,6 +235,20 @@ export async function createHarness() {
 
   const cleanup = () => rmSync(dir, { recursive: true, force: true })
 
+  /**
+   * 再跑一次 apply(ctx, { storeFile }) —— 这就是宿主热重载真正做的事：整个模块
+   * 重新求值，apply 再执行一遍，旧实例的清理函数被调掉、新实例重新注册路由与工具。
+   *
+   * 注意它和 `callTool({action:'reload'})` 不是一回事：reload 只是重新读一遍文件，
+   * 实例没换、闭包没换，跨实例的问题（旧 hook 回落到旧文档、旧 agent 不迁移）
+   * 用它根本测不出来 —— 以前几个用例就是这么假通过的。
+   */
+  const reapply = async () => {
+    apply(ctx, { storeFile })
+    // apply 里的首次 loadStore 是异步的，等它落地再往下走。
+    await delay(40)
+  }
+
   return {
     dir,
     storeFile,
@@ -237,8 +257,11 @@ export async function createHarness() {
     createAgent,
     emit,
     readStore,
+    reapply,
     cleanup,
     getTool: () => tool,
     getRoute: () => route,
+    /** 顶层 ctx 上某个事件挂了多少个 listener（agent 自己的用 createAgent 返回值）。 */
+    listenerCount: (event) => (listeners.get(event) ?? []).length,
   }
 }

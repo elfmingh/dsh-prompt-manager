@@ -1,8 +1,13 @@
 /**
- * 针对 codex 审查（2026-10-26）指出的几处修复的回归测试。
+ * 针对 codex 审查（2026-10-26）指出的修复的回归测试。
  *
- * 每个用例都对应一个「旧代码会挂、新代码才过」的具体路径，写测试前先在旧版
- * 实现上确认过它确实是红的 —— 否则只是给已经正确的代码再加一道装饰。
+ * 每个用例都用 `harness.reapply()` 造出**真正的新实例**（宿主热重载做的事）。
+ * #13 / #14 / #16 / #17 都在旧实现上实测过是红的：撤掉对应的修复再跑，它们就会挂
+ * （已逐个验证）。#15 是补充保护 —— 旧版本就记录了 tool disposer，它通过是正常的，
+ * 加它是为了防止以后再次退化。
+ *
+ * 早前这一组用的是 `reload`，而 reload 只重读文件、实例没换，跨实例的 bug 一个都
+ * 测不出来，所以那几条当时是假通过的。
  */
 import { mkdirSync, rmSync } from 'node:fs'
 import { test } from 'node:test'
@@ -62,8 +67,8 @@ test('#14 卸载后旧 hook 不会回落到更早实例的文档', () => withHar
   const disabled = (await agent.assemble(fixture())).sections.map((s) => s.name)
   assert.ok(!disabled.includes('harness:identity'), 'A 实例下该段落应当被禁用')
 
-  // 重载成 B
-  await harness.callTool({ action: 'reload' })
+  // 重载成 B —— 必须是真换实例，否则旧 hook 的闭包还是 A 的，测不出回落。
+  await harness.reapply()
 
   // B：恢复
   await harness.callTool({ action: 'override.reset', name: 'harness:identity', sessionId: 's1' })
@@ -109,6 +114,9 @@ test('#16 0.2.4 的旧 agent state 会被迁移，而不是在同步时抛错', 
   await agent.assemble(fixture())
   let oldHookDisposed = false
   // 模拟旧版本留下的状态：cleanups 里混着 section 和 hook 的 disposer。
+  // 真实升级时那个 hook 会被 disposeHook 摘掉，这里用 dropListeners 复现同样的
+  // 前置条件 —— 否则真 hook 还挂着，迁移后会多出一份，测的是测试自己的构造缺陷。
+  agent.dropListeners('system-prompt/assemble')
   agent.agent[AGENT_STATE] = {
     cleanups: [() => { oldHookDisposed = true }],
     hookAttached: true,
@@ -128,6 +136,8 @@ test('#16 0.2.4 的旧 agent state 会被迁移，而不是在同步时抛错', 
 
   // 迁移后 hook 要能重挂，否则这个会话的动态层永久消失。
   assert.equal(migrated.hookAttached, true, '同步后 hook 应当重新挂上')
+  // 而且只能有一个：迁移把旧 hook 摘掉、又挂上新的，多挂一份会让规则跑两遍。
+  assert.equal(agent.listenerCount('system-prompt/assemble'), 1, '迁移后不应出现重复的 assemble hook')
   const names = (await agent.assemble(fixture())).sections.map((s) => s.name)
   assert.ok(!names.includes('harness:identity'), '迁移后 hook 仍然有效，规则照常生效')
 }))
@@ -143,10 +153,12 @@ test('#17 热重载后新配置的工作区对旧 agent 也生效', () => withHa
   const agent = harness.createAgent('s1', 'D:/work')
   await agent.assemble(fixture())
 
+  // 真换实例：旧 hook 的闭包停在 A 的文档上，这正是要测的东西。
+  await harness.reapply()
+
   await harness.callTool({ action: 'library.add', id: 'hot', text: '热点条目' })
   await harness.callTool({ action: 'apply.hotReload', workspacePath: 'D:/work', enabled: true })
   await harness.callTool({ action: 'apply.toggle', id: 'hot', scope: 'workspace', workspacePath: 'D:/work', enabled: true })
-  await harness.callTool({ action: 'reload' })
 
   const names = (await agent.assemble(fixture())).sections.map((s) => s.name)
   assert.ok(

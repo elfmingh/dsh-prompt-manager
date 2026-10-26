@@ -102,17 +102,23 @@ function drainLegacyRegistry() {
   const legacy = globalThis[LEGACY_DISPOSER_REGISTRY]
   if (!legacy || typeof legacy !== 'object') return
   try {
-    for (const list of Array.isArray(legacy.all) ? legacy.all : []) {
-      while (list.length) {
-        const dispose = list.pop()
-        try {
-          if (typeof dispose === 'function') dispose()
-        } catch {
-          /* 清理失败不应阻断后续清理 */
+    // 0.2.4 的 all 是 **Set**，不是数组。用 Array.isArray 判断会永远为假 ——
+    // 结果是「一个 disposer 都没执行，却把注册表删掉了」，比不迁移更糟：既没清掉
+    // 旧实例的 route/tool/watcher，又丢掉了以后找回它们的唯一入口。
+    const lists = legacy.all
+    if (lists && typeof lists[Symbol.iterator] === 'function') {
+      for (const list of lists) {
+        while (Array.isArray(list) && list.length) {
+          const dispose = list.pop()
+          try {
+            if (typeof dispose === 'function') dispose()
+          } catch {
+            /* 清理失败不应阻断后续清理 */
+          }
         }
       }
     }
-    legacy.all = new Set()
+    if (lists && typeof lists.clear === 'function') lists.clear()
     legacy.current = null
     legacy.state = null
   } catch {
@@ -124,6 +130,16 @@ function drainLegacyRegistry() {
     /* 删不掉也无所谓，下一次 apply 会再清一遍 */
   }
 }
+
+/**
+ * 0.2.4 把每个建过的 agent 都塞进了 `globalThis[AGENT_REGISTRY]`（一个 Set）。
+ *
+ * 那个 Set 当时是为「记录还活着的 agent」而写的，没有任何读者，后来在本轮重构里
+ * 被删掉了。对**升级**来说它恰好是唯一入口：新实例的 runningAgents 是空的，
+ * 而 agent/created 不会因为插件重新加载而再发一次 —— 升级前就活着的 agent 永远
+ * 等不到迁移，它们的旧 hook 会一直停留在旧代码上。
+ */
+const LEGACY_AGENT_REGISTRY = Symbol.for('vertixara.dsh-prompt-manager/agents')
 
 function trackDisposer(scope, dispose) {
   if (typeof dispose !== 'function') return
@@ -243,9 +259,7 @@ function agentStateOf(agent) {
     // 只读 Proxy 的 getter 会抛，别让它冒到 agent/created 的 catch 里变成莫名一条。
     return null
   }
-  // 认的只有「带 sectionDisposers 数组」的新结构。0.2.4 的旧结构是
-  // { cleanups: [], hookAttached } —— 直接当新的用会在 .sectionDisposers.splice
-  // 上抛错，而后面的清理逻辑早就按新结构写了。
+  // 认的只有「带 sectionDisposers 数组」的新结构。
   if (state && Array.isArray(state.sectionDisposers)) return state
   if (!state) {
     // section 的 disposers 和 assemble hook 的 disposer **必须分开放**。
@@ -253,14 +267,14 @@ function agentStateOf(agent) {
     // 一起 splice 掉，而 hookAttached 仍是 true、不会重挂 —— 那个会话的动态层
     // 就永久消失了。这是 bfcaaeb 引入的回归，之前两者是分池的。
     state = { sectionDisposers: [], hookDispose: null, hookAttached: false }
-  } else {
+  } else if (Array.isArray(state.cleanups)) {
     // 从 0.2.4 升级上来：旧 cleanups 里**混着** hook 的 disposer（0.2.4 是
     // `state.cleanups.push(disposeHook)` 直接塞进去的）。不能把它们当成
     // sectionDisposers 继承 —— 那等于把 hook 的摘除权交给 syncAgentSections，
     // 一改文档就重演同一个 bug。全部执行掉：它们摘的正是旧实例留下的 section
     // 和旧 hook，然后按「什么都没挂」重新来过。
     try {
-      for (const dispose of Array.isArray(state.cleanups) ? state.cleanups.splice(0) : []) {
+      for (const dispose of state.cleanups.splice(0)) {
         try {
           if (typeof dispose === 'function') dispose()
         } catch {
@@ -272,6 +286,14 @@ function agentStateOf(agent) {
       /* 同上 */
     }
     state = { sectionDisposers: [], hookDispose: null, hookAttached: false }
+  } else {
+    // 认不出来的形状。**不要**去执行它里面的东西，也不要覆盖它的字段：
+    // 不知道那些 disposer 是谁挂的，执行了可能把别人的注册摘掉；擅自把
+    // hookAttached 置 false 又会让 hook 被重挂，变成两份。就地补齐缺的字段，
+    // 按「已经挂了」对待，让调用方别重挂。
+    state.sectionDisposers = []
+    state.hookDispose = typeof state.hookDispose === 'function' ? state.hookDispose : null
+    state.hookAttached = state.hookAttached === true
   }
   try {
     agent[AGENT_STATE] = state
@@ -1032,15 +1054,19 @@ function workspaceEntries(document = state.document) {
     }
     try {
       const disposeHook = agent.ctx.on('system-prompt/assemble', async (assembly, context, next) => {
+        // waterfall 契约：不调 next 就等于独占了整条装配链，排在我们后面的
+        // listener 一个都不会执行。这个 hook 原先只声明 (assembly) 一个参数、
+        // 从不调 next —— 现在没出事只是因为还没有别的插件监听这个事件。
+        //
+        // 顺序选「先 next 再加工」：用户的覆盖规则是最终裁决，必须作用在下游的
+        // 结果之上；反过来先改再 next，下游就能把它们盖掉。宿主契约里 `assembly`
+        // 虽然允许原地修改，但返回值才是权威的，所以这里一律构造新对象。
+        //
+        // next() 放在 try **外面**：下游抛错要原样冒给宿主。包在里面的话，下游
+        // 装配失败会被这里吞掉、再返回一份原始 assembly —— 调用方拿到的是「成功」
+        // 结果，永远不知道下游挂了。
+        const downstream = (await next()) ?? assembly
         try {
-          // waterfall 契约：不调 next 就等于独占了整条装配链，排在我们后面的
-          // listener 一个都不会执行。这个 hook 原先只声明 (assembly) 一个参数、
-          // 从不调 next —— 现在没出事只是因为还没有别的插件监听这个事件。
-          //
-          // 顺序选「先 next 再加工」：用户的覆盖规则是最终裁决，必须作用在下游的
-          // 结果之上；反过来先改再 next，下游就能把它们盖掉。宿主契约里 `assembly`
-          // 虽然允许原地修改，但返回值才是权威的，所以这里一律构造新对象。
-          const downstream = (await next()) ?? assembly
           // 现取最新 store：这个 hook 可能属于上一个 apply 实例（热重载摘不掉它），
           // 读闭包里的 state 会永远停在重载前那份文档上。整段装配必须统一用这一份，
           // 不能规则取新的、条目取旧的。
@@ -1129,7 +1155,9 @@ function workspaceEntries(document = state.document) {
           return { ...downstream, sections: [...sections, ...extras], contexts }
         } catch (error) {
           log(`assemble-hook-failed ${error?.message ?? error}`)
-          return assembly
+          // 本地加工失败时退回**下游的结果**，不是原始的 assembly —— 下游的加工
+          // 已经做完了，丢掉它等于把别人的工作一并抹掉。
+          return downstream
         }
       })
       // 只在真拿到 disposer 之后才置 hookAttached：如果宿主返回的形态无法识别，
@@ -1161,6 +1189,46 @@ function workspaceEntries(document = state.document) {
       } catch (error) {
         log(`refresh-failed ${sessionId}: ${error?.message ?? error}`)
       }
+    }
+  }
+
+  /**
+   * 收编 0.2.4 留下的 agent。
+   *
+   * 热重载不会为已经存在的会话再发一次 agent/created，所以新实例的 runningAgents
+   * 是空的：升级前就活着的 agent 既不会迁移 state（仍是 {cleanups, hookAttached}），
+   * 也不会重挂 hook，它们的 hook 一直停在旧代码上 —— 旧代码不调 next、读的是旧
+   * 注册表键。放进 runningAgents 之后再走一次 syncAgentSections，迁移和重挂都在
+   * 那条路上。0.2.4 的 AGENT_REGISTRY 是唯一能找回这些 agent 的入口。
+   */
+  function adoptLegacyAgents() {
+    let agents
+    try {
+      agents = globalThis[LEGACY_AGENT_REGISTRY]
+    } catch {
+      return
+    }
+    if (!agents || typeof agents[Symbol.iterator] !== 'function') return
+    let adopted = 0
+    try {
+      for (const agent of [...agents]) {
+        try {
+          const sessionId = sessionIdOf(agent)
+          if (sessionId) runningAgents.set(sessionId, agent)
+          syncAgentSections(agent)
+          adopted += 1
+        } catch (error) {
+          diag(`legacy-agent-adopt-failed ${error?.message ?? error}`)
+        }
+      }
+    } catch (error) {
+      diag(`legacy-agent-scan-failed ${error?.message ?? error}`)
+    }
+    if (adopted) diag(`legacy-agents-adopted ${adopted}`)
+    try {
+      delete globalThis[LEGACY_AGENT_REGISTRY]
+    } catch {
+      /* 删不掉不影响功能，下次 apply 会再扫一遍 */
     }
   }
 
@@ -1564,7 +1632,8 @@ function workspaceEntries(document = state.document) {
         }
         // 基线是「会话开始那一刻的全局规则」副本。全量恢复若只清磁盘不清它，
         // 运行中的会话会在下次打开总开关时把刚清掉的旧规则复活。
-        sessionBaselines.clear()
+        // 但这一步本身会改变实际提示词 —— 必须放在保存成功之后，否则一次写盘
+        // 失败就变成「界面报错、磁盘没变、运行中的提示词已经变了」。
         await saveStore({
           ...document,
           overrides: {
@@ -1576,6 +1645,8 @@ function workspaceEntries(document = state.document) {
             saved: saved.slice(0, 100),
           },
         })
+        // 保存成功后再清基线 —— 顺序反过来就会在写盘失败时提前改变运行中的提示词。
+        sessionBaselines.clear()
         refreshRunningAgents()
         return `已恢复全部内置提示词，清除 ${count} 项规则（覆盖文本已归档 ${saved.length} 条）`
       }
@@ -1965,7 +2036,12 @@ function workspaceEntries(document = state.document) {
   }
 
   loadStore()
-    .then((document) => diag(`initial-load-ok entries=${document.entries.length} temporary=${document.temporary.length}`))
+    .then((document) => {
+      diag(`initial-load-ok entries=${document.entries.length} temporary=${document.temporary.length}`)
+      // 文档就绪之后才收编旧 agent：syncAgentSections 要按新文档算静态层，
+      // 在文档还是空壳时同步会把它们的段落注册成一份空的。
+      adoptLegacyAgents()
+    })
     .catch((error) => diag(`initial-load-failed ${error?.stack ?? error}`))
 
   ctx.on('agent/created', (payload) => {
