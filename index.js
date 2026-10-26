@@ -17,6 +17,7 @@
  * 管理：模型工具 `prompt_manager` + Web UI + HTTP 路由 /prompt-manager/api
  */
 import { readFile, writeFile, rename, unlink } from 'node:fs/promises'
+import { setTimeout as sleep } from 'node:timers/promises'
 import { watch, appendFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
@@ -498,17 +499,41 @@ export function apply(ctx, config = {}) {
     const tempFile = `${storeFile}.${process.pid}-${Date.now().toString(36)}.tmp`
     try {
       await writeFile(tempFile, payload, 'utf8')
-      await rename(tempFile, storeFile)
-    } catch (error) {
+      await commitTemp(tempFile, payload)
+    } finally {
       try {
         await unlink(tempFile)
       } catch {
-        /* 临时文件可能根本没建立，清理失败不影响主错误 */
+        /* rename 成功后它已经不在了 */
       }
-      throw error
     }
     state.document = normalized
     return normalized
+  }
+
+  /**
+   * 把临时文件挪到正式位置。Windows 上目标被杀软、搜索索引或另一个句柄短暂占用时
+   * rename 会抛 EPERM/EBUSY/EACCES —— 而这时数据其实已经完整落进临时文件了。
+   * 直接抛错等于让用户「改完设置、界面报成功、实际没磁盘上没变」，静默丢配置比
+   * 牺牲一次原子性严重得多，所以分两层兜：先短暂重试 rename（多数占用是毫秒级），
+   * 还不行再退化成直接覆盖写（放弃原子性，但保证内容写进去）。
+   */
+  async function commitTemp(tempFile, payload) {
+    let lastError = null
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      try {
+        await rename(tempFile, storeFile)
+        return
+      } catch (error) {
+        lastError = error
+        const transient = error?.code === 'EPERM' || error?.code === 'EBUSY' || error?.code === 'EACCES'
+        if (!transient) throw error
+        // 25ms、50ms、75ms —— 够杀软扫完一个小 JSON，又不会让 UI 明显卡住。
+        await sleep(25 * (attempt + 1))
+      }
+    }
+    log(`store-write-retry ${lastError?.code}: rename 四次失败，退化为直接覆盖`)
+    await writeFile(storeFile, payload, 'utf8')
   }
 
   // ------------------------------------------------------------- resolution
