@@ -286,7 +286,21 @@ export async function createHarness() {
       if (entry) {
         delete entry.agents
         delete entry.lastDocument
+        delete entry.all
       }
+    },
+    /**
+     * 模拟 `6c98aca` 留下的表：agents 是 Map，但值是**裸 agent** 而不是 WeakRef。
+     * 新版只把值当 WeakRef 解引用、不回写的话，强引用照旧存在。
+     */
+    simulateBareAgentMap: (sessionId, agent) => {
+      const entry = globalThis[Symbol.for(`vertixara.dsh-prompt-manager/disposers:${storeFile}`)]
+      if (entry?.agents instanceof Map) entry.agents.set(sessionId, agent)
+    },
+    /** 读 registry 里的 agents 表，供测试断言。 */
+    readAgentsTable: () => {
+      const entry = globalThis[Symbol.for(`vertixara.dsh-prompt-manager/disposers:${storeFile}`)]
+      return entry?.agents ?? null
     },
     /** 顶层 ctx 上某个事件挂了多少个 listener（agent 自己的用 createAgent 返回值）。 */
     listenerCount: (event) => (listeners.get(event) ?? []).length,

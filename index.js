@@ -95,6 +95,18 @@ function registry(scope) {
   if (!('lastDocument' in entry)) entry.lastDocument = null
   if (!('state' in entry)) entry.state = null
   if (!('current' in entry)) entry.current = null
+  // 值也要迁移：更早的版本（6c98aca 及之前）往这张表里存的是**裸 agent**，
+  // 不是 WeakRef。只把它当 WeakRef 解引用而不回写，等于强引用照旧攥着 ——
+  // WeakRef 想解决的泄漏一点没变。这里就地包一层，幂等。
+  for (const [sessionId, value] of [...entry.agents]) {
+    if (!value || typeof value.deref === 'function') continue
+    try {
+      entry.agents.set(sessionId, new WeakRef(value))
+    } catch {
+      // 不可弱引用的值（原始类型之类）直接丢掉，留着也没有意义。
+      entry.agents.delete(sessionId)
+    }
+  }
   return entry
 }
 
@@ -1248,6 +1260,14 @@ function workspaceEntries(document = state.document) {
    * 那条路上。0.2.4 的 AGENT_REGISTRY 是唯一能找回这些 agent 的入口。
    */
   function adoptLegacyAgents() {
+    // 实例有效性检查放在函数里，而不是每个调用点各写一遍 —— 三个入口（bootstrap、
+    // watcher、工具动作）里漏掉任何一个，过期实例就能执行不可逆的接管：把旧 Set
+    // 吃掉、跑掉旧 cleanup、按**它自己**那份文档注册静态段落并冻结基线。之后真正
+    // 活着的实例再怎么刷新也不会重新冻结基线，规则永久错位。
+    if (registry(storeFile).state !== state) {
+      diag('legacy-adopt-skipped stale-instance')
+      return
+    }
     let agents
     try {
       agents = globalThis[LEGACY_AGENT_REGISTRY]
@@ -2104,15 +2124,9 @@ function workspaceEntries(document = state.document) {
         diag('legacy-adopt-skipped load-failed')
         return
       }
-      // 这个回调是异步的：等待期间实例可能已经被卸载，或者又被下一次热重载替换掉。
-      // 作废的实例不能再去动 agent —— 它注册的 hook 已经摘不掉，去重挂只会把
-      // 别人的会话弄乱，而业务上该由新实例接管这些 agent。
-      if (registry(storeFile).state !== state) {
-        diag('legacy-adopt-skipped stale-instance')
-        return
-      }
       // 文档就绪之后才收编旧 agent：syncAgentSections 要按新文档算静态层，
       // 在文档还是空壳时同步会把它们的段落注册成一份空的。
+      // 实例有效性检查在 adoptLegacyAgents 内部统一做。
       adoptLegacyAgents()
     })
     .catch((error) => diag(`initial-load-failed ${error?.stack ?? error}`))

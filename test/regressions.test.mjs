@@ -248,3 +248,22 @@ test('#20 旧版 registry 缺少后来新增的字段时自动补齐', () => wit
   const result = await agent.assemble(fixture())
   assert.ok(Array.isArray(result.sections), '新实例在补过字段的表上应当正常装配')
 }))
+
+test('#21 继承下来的裸 agent 会被转成 WeakRef', () => withHarness(async (harness) => {
+  const agent = harness.createAgent('s1')
+
+  // 6c98aca 留下的表：Map 里的值是裸 agent，不是 WeakRef。
+  harness.simulateBareAgentMap('s1', agent.agent)
+
+  await harness.reapply()
+
+  // 只把值当 WeakRef 解引用而不回写，等于强引用照旧攥着 —— WeakRef 要解决的
+  // 跨实例泄漏一点没变。所以这里断言表里存的**确实**是 WeakRef。
+  const table = harness.readAgentsTable()
+  assert.ok(table instanceof Map, 'agents 表应当存在')
+  assert.ok(
+    table.get('s1') instanceof WeakRef,
+    '继承下来的裸 agent 应当被就地转成 WeakRef',
+  )
+  assert.equal(table.get('s1').deref(), agent.agent, '转完之后仍应指向同一个 agent')
+}))
