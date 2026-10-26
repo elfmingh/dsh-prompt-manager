@@ -40,6 +40,10 @@ export async function createHarness() {
 
   const listeners = new Map()
   const cwdBySession = new Map()
+  // Cordis 的插件卸载不是事件，而是 fiber effect 回收：ctx.effect(fn) 里的 fn 返回的
+  // cleanup 在卸载时被调用。真要测「卸载时释放路由」就得模拟这条路径，光发一个
+  // 'dispose' 事件是测不到的 —— 宿主里根本没有那个事件。
+  const effects = []
   let tool = null
   let route = null
 
@@ -71,6 +75,15 @@ export async function createHarness() {
       const list = listeners.get(event) ?? []
       list.push(handler)
       listeners.set(event, list)
+      return () => {
+        const current = listeners.get(event) ?? []
+        const index = current.indexOf(handler)
+        if (index >= 0) current.splice(index, 1)
+      }
+    },
+    effect(fn) {
+      const cleanup = fn()
+      if (typeof cleanup === 'function') effects.push(cleanup)
     },
     get(name) {
       // 插件用 ctx.get('workingDirectory').get(session) 取会话的工作目录。
@@ -91,6 +104,16 @@ export async function createHarness() {
 
   const emit = (event, payload) => {
     for (const handler of listeners.get(event) ?? []) handler(payload)
+    // 模拟插件被卸载：真实宿主走 fiber effect 回收，这里用 'dispose' 事件触发。
+    if (event === 'dispose') {
+      while (effects.length) {
+        try {
+          effects.pop()()
+        } catch {
+          /* 单个 effect 清理失败不影响其余 */
+        }
+      }
+    }
   }
 
   const callTool = async (args) => {
@@ -129,6 +152,12 @@ export async function createHarness() {
         },
         on(event, handler) {
           handlers.set(event, handler)
+          // 真宿主（Cordis）的 ctx.on 返回 disposer，调用后监听就摘掉。
+          // 这里必须照做，否则「hook 被 sync 误摘」这类 bug 在测试里永远看不见：
+          // 返回 undefined 时插件侧记不到 disposer，也就无从被摘下。
+          return () => {
+            if (handlers.get(event) === handler) handlers.delete(event)
+          }
         },
       },
     }

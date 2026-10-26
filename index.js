@@ -72,25 +72,26 @@ function stringList(value) {
  * 日志里那两条 "duplicate exact route" 就是这么来的。globalThis 在重载前后是同一个
  * 对象，新模块能看见旧实例留下的清理函数。
  *
- * 已知限制：这是**进程级**单例。同一个 Node 进程里如果同时加载两份本插件（两个
- * profile、或宿主用 isolate 起两个 scope），后一个的 `disposeAll()` 会把前一个的
- * 注册一起摘掉，`state` 也会互相覆盖。换成按实例隔离会让热重载失效（新 ctx 是新
- * 对象，认不出旧实例），所以这里选了保住热重载。DSH 正常单实例运行不受影响。
+ * 键里带 scope（用 storeFile 当实例标识）：同一进程里挂着两份插件时（两个 profile、
+ * 或测试里两个 harness 同时活着），它们各用各的槽，后一个不会把前一个的 route /
+ * tool / watcher 一起摘掉。热重载前后 storeFile 不变，所以仍然能共享同一个槽 ——
+ * 这正是我们需要的那一半。固定的单一 Symbol 键做不到这件事。
  */
-const DISPOSER_REGISTRY = Symbol.for('vertixara.dsh-prompt-manager/disposers')
+const DISPOSER_REGISTRY_PREFIX = 'vertixara.dsh-prompt-manager/disposers:'
 
-function registry() {
-  let entry = globalThis[DISPOSER_REGISTRY]
+function registry(scope) {
+  const key = Symbol.for(`${DISPOSER_REGISTRY_PREFIX}${scope}`)
+  let entry = globalThis[key]
   if (!entry) {
-    entry = { current: null, all: new Set() }
-    globalThis[DISPOSER_REGISTRY] = entry
+    entry = { current: null, all: new Set(), state: null, scope }
+    globalThis[key] = entry
   }
   return entry
 }
 
-function trackDisposer(dispose) {
+function trackDisposer(scope, dispose) {
   if (typeof dispose !== 'function') return
-  const entry = registry()
+  const entry = registry(scope)
   if (!entry.current) {
     entry.current = []
     entry.all.add(entry.current)
@@ -98,8 +99,8 @@ function trackDisposer(dispose) {
   entry.current.push(dispose)
 }
 
-function disposeAll() {
-  const entry = registry()
+function disposeAll(scope) {
+  const entry = registry(scope)
   for (const list of entry.all) {
     while (list.length) {
       const dispose = list.pop()
@@ -112,6 +113,9 @@ function disposeAll() {
   }
   entry.all.clear()
   entry.current = null
+  // 顺手把 store 引用也置空：卸载之后还挂在 agent 上的旧 hook 会经 currentState
+  // 回落到它自己闭包里那份 state，而不是继续读一个永远不会再更新的死实例文档。
+  entry.state = null
 }
 
 /**
@@ -122,8 +126,8 @@ function disposeAll() {
  * state，那份 state 已经不再被 watcher 更新，面板改什么都看不见。
  * 让它每次现取最新的 state，旧 hook 就自动跟上了新实例的数据。
  */
-function currentState(fallback) {
-  const entry = registry()
+function currentState(scope, fallback) {
+  const entry = registry(scope)
   return entry.state ?? fallback
 }
 
@@ -171,49 +175,100 @@ async function commitTemp(tempFile, targetFile, renameImpl = rename) {
  */
 const AGENT_STATE = Symbol.for('vertixara.dsh-prompt-manager/agent-state')
 
+/**
+ * 把各种形态的「可释放句柄」统一成一个函数。
+ *
+ * Cordis 4 的 `ctx.on()` 返回函数，但它的类型里 Disposable / AsyncDisposable 都合法，
+ * 宿主哪天换成 `{ dispose() }` 或 `Symbol.dispose`，只判函数就会漏记，而漏记的后果
+ * 是 hook 摘不掉、`hookAttached` 却已经是 true —— 之后重挂会挂第二份，段落重复。
+ */
+function asDisposer(value) {
+  if (typeof value === 'function') return value
+  if (value && typeof value.dispose === 'function') return () => value.dispose()
+  if (value && typeof value[Symbol.dispose] === 'function') return () => value[Symbol.dispose]()
+  return null
+}
+
 function agentStateOf(agent) {
   if (!agent || (typeof agent !== 'object' && typeof agent !== 'function')) return null
-  let state = agent[AGENT_STATE]
+  let state
+  try {
+    state = agent[AGENT_STATE]
+  } catch {
+    // 只读 Proxy 的 getter 会抛，别让它冒到 agent/created 的 catch 里变成莫名一条。
+    return null
+  }
   if (!state) {
-    state = { cleanups: [], hookAttached: false }
+    // section 的 disposers 和 assemble hook 的 disposer **必须分开放**。
+    // 放同一个数组里的话，任何一次文档变更触发的 syncAgentSections 会把 hook
+    // 一起 splice 掉，而 hookAttached 仍是 true、不会重挂 —— 那个会话的动态层
+    // 就永久消失了。这是 bfcaaeb 引入的回归，之前两者是分池的。
+    state = { sectionDisposers: [], hookDispose: null, hookAttached: false }
     try {
       agent[AGENT_STATE] = state
     } catch {
-      // agent 被冻结或是只读 Proxy：拿不到状态就不挂，宁可不生效也不要抛错。
+      // agent 被冻结：拿不到状态就不挂，宁可不生效也不要抛错。
       return null
     }
   }
   return state
 }
 
-/** 摘掉这个 agent 上的全部注册；hookAttached 复位，允许重新挂。 */
+/**
+ * 摘掉这个 agent 上的全部注册；hookAttached 复位，允许重新挂。
+ *
+ * 这个方法只给 agent/disposed 和「实例真的被替换掉」用。日常的文档变更走
+ * syncAgentSections，那条路**不碰 hook** —— 见下面的分池说明。
+ */
 function releaseAgent(agent) {
-  const state = agent?.[AGENT_STATE]
-  if (!state) return
-  for (const dispose of state.cleanups.splice(0)) {
+  let agentState
+  try {
+    agentState = agent?.[AGENT_STATE]
+  } catch {
+    return
+  }
+  if (!agentState) return
+  const disposers = agentState.sectionDisposers.splice(0)
+  if (agentState.hookDispose) disposers.push(agentState.hookDispose)
+  for (const dispose of disposers) {
     try {
       dispose()
     } catch {
       /* 单个清理失败不影响其余 */
     }
   }
-  state.hookAttached = false
+  agentState.hookDispose = null
+  agentState.hookAttached = false
 }
 
 export function apply(ctx, config = {}) {
-  // 上一次 apply 的残留先摘掉，否则注册同一路径会抛 duplicate route。
-  disposeAll()
-  trackDisposer(() => {}) // 建立本次 apply 的列表，后续 trackDisposer 归到这里
-  // 清理钩子必须挂在这里，而不是 apply 末尾：后面任何一步抛错，末尾那行就执行不到，
-  // 这一次 apply 注册的东西就会永久留在宿主里。事件名按宿主实际提供的来，不存在就跳过。
-  for (const event of ['dispose', 'teardown']) {
-    try {
-      ctx.on(event, disposeAll)
-    } catch {
-      /* 宿主没有这个事件 */
-    }
-  }
+  // 实例标识要在清理之前算出来：注册表按它分槽，不同实例互不干扰。
   const storeFile = (config && config.storeFile) || join(dshHome(), 'prompt-manager.json')
+  // 上一次 apply 的残留先摘掉，否则注册同一路径会抛 duplicate route。
+  disposeAll(storeFile)
+  trackDisposer(storeFile, () => {}) // 建立本次 apply 的列表，后续 trackDisposer 归到这里
+  // 清理钩子必须挂在开头，而不是 apply 末尾：后面任何一步抛错，末尾那行就执行不到，
+  // 这一次 apply 注册的东西就会永久留在宿主里。
+  //
+  // 用 ctx.effect 而不是 ctx.on('dispose')：Cordis 4 没有 dispose / teardown 事件，
+  // 插件的卸载走的是 fiber effect 回收（cordis/src/events.ts 的 emit 点只有
+  // internal/* 那几个）。挂不存在的事件名不会报错，只会静默变成一段永远不执行的
+  // 死代码 —— 后果是插件被禁用后路由还在应答、watcher 还在跑。
+  try {
+    if (typeof ctx.effect === 'function') {
+      ctx.effect(() => () => disposeAll(storeFile))
+    } else {
+      for (const event of ['dispose', 'teardown']) {
+        try {
+          ctx.on(event, () => disposeAll(storeFile))
+        } catch {
+          /* 老宿主：没有这个事件就跳过 */
+        }
+      }
+    }
+  } catch (error) {
+    diag(`dispose-hook-failed ${error?.message ?? error}`)
+  }
   const state = { document: emptyDocument() }
   const runningAgents = new Map()
   const sessionFacts = new Map()
@@ -683,8 +738,12 @@ export function apply(ctx, config = {}) {
    * 后注入层：会话临时条目（必须每轮生效）+ 开启了后注入的工作区条目。
    * 每次 system-prompt/assemble 都重新解析，所以改完下一轮立即生效。
    */
-  function resolveDynamicItems(facts) {
-    const document = state.document
+  /**
+   * 动态层条目。`document` 默认取本实例的 store，但 assemble hook 会显式传入它
+   * 现取到的那份 —— 否则一次装配里规则来自新文档、条目来自旧文档，会出现
+   * 「新文档已经删掉的临时条目还在被注入，新 replace 规则作用在旧文本上」。
+   */
+  function resolveDynamicItems(facts, document = state.document) {
     const workspaceKey = matchWorkspaceKey(facts?.cwd)
     const workspace = workspaceKey ? document.applications.workspaces[workspaceKey] : undefined
     const disabled = new Set(workspace?.disabled ?? [])
@@ -767,10 +826,17 @@ export function apply(ctx, config = {}) {
     // `state`（store 文档）。同名会把 store 遮住，将来在这里读 state.document 就会
     // 静默拿到错误的对象。
     const agentState = agentStateOf(agent)
-    if (!agentState) return
-    // 只摘 section，保留 hookAttached：assemble hook 是独立的一次性注册，
-    // 不能因为条目变化就被拆掉重挂。
-    for (const dispose of agentState.cleanups.splice(0)) {
+    if (!agentState) {
+      // 拿不到状态槽说明 agent 被冻结或是只读 Proxy。这时这个会话完全拿不到注入，
+      // 必须留下痕迹 —— 否则用户只看到「这个会话的规则没生效」，日志里一个字都没有。
+      diag(`agent-state-unavailable sid=${sessionId || '-'}`)
+      return
+    }
+    // 只摘 section 的注册，**绝不碰 hook**：hook 是一次性的、生命周期跟 agent 走的
+    // 注册，条目变了不代表 hook 该重挂。两者分池存放就是为了这条 —— 早先它们共用
+    // 一个数组，任何一次文档变更都会把 hook 一起摘掉，而 hookAttached 还是 true，
+    // 于是那个会话的动态层永久消失。
+    for (const dispose of agentState.sectionDisposers.splice(0)) {
       try {
         dispose()
       } catch {
@@ -781,7 +847,7 @@ export function apply(ctx, config = {}) {
     const items = resolveStaticItems(facts)
     for (const item of items) {
       try {
-        agentState.cleanups.push(agent.ctx.systemPrompt.section({
+        agentState.sectionDisposers.push(agent.ctx.systemPrompt.section({
           name: sectionName(item.id, item.source),
           order: item.order,
           text: item.text,
@@ -828,7 +894,12 @@ export function apply(ctx, config = {}) {
   function attachAssembleHook(agent) {
     if (!agent?.ctx?.on) return
     const agentState = agentStateOf(agent)
-    if (!agentState || agentState.hookAttached) return
+    if (!agentState) {
+      // 同 syncAgentSections：状态槽拿不到就没法挂 hook，得留下痕迹。
+      diag(`agent-state-unavailable attach sid=${sessionIdOf(agent) || '-'}`)
+      return
+    }
+    if (agentState.hookAttached) return
     const sessionId = sessionIdOf(agent)
     const facts = { sessionId, cwd: workingDirectoryOf(agent), ...agentFacts(agent) }
     if (sessionId) {
@@ -839,8 +910,10 @@ export function apply(ctx, config = {}) {
       const disposeHook = agent.ctx.on('system-prompt/assemble', (assembly) => {
         try {
           // 现取最新 store：这个 hook 可能属于上一个 apply 实例（热重载摘不掉它），
-          // 读闭包里的 state 会永远停在重载前那份文档上。
-          const overrides = currentState(state).document.overrides
+          // 读闭包里的 state 会永远停在重载前那份文档上。整段装配必须统一用这一份，
+          // 不能规则取新的、条目取旧的。
+          const live = currentState(storeFile, state)
+          const overrides = live.document.overrides
           // 总开关不冻结：它是全局刹车，要立刻有效。
           const active = overrides?.enabled === true
           // 全局规则取会话启动时的基线（主页改动只对新会话生效）；
@@ -853,7 +926,7 @@ export function apply(ctx, config = {}) {
           const sessionContextRules = active && sessionId ? (overrides.sessionContexts?.[sessionId] ?? {}) : {}
           const sectionRules = active ? { ...baseline.sections, ...sessionSectionRules } : {}
           const contextRules = active ? { ...baseline.contexts, ...sessionContextRules } : {}
-          const items = resolveDynamicItems(facts)
+          const items = resolveDynamicItems(facts, live.document)
           const hasRules = Object.keys(sectionRules).length > 0 || Object.keys(contextRules).length > 0
 
           // 先留一份规则应用之前的原始装配：面板必须能看到被禁用的条目，
@@ -927,10 +1000,18 @@ export function apply(ctx, config = {}) {
           return assembly
         }
       })
-      if (typeof disposeHook === 'function') agentState.cleanups.push(disposeHook)
+      // 只在真拿到 disposer 之后才置 hookAttached：如果宿主返回的形态无法识别，
+      // 标记成「已挂」会让以后所有重挂都跳过，反而把 hook 永久钉死在那儿。
+      const hookDispose = asDisposer(disposeHook)
+      if (!hookDispose) {
+        diag(`assemble-hook-undisposable type=${typeof disposeHook}`)
+        return
+      }
+      agentState.hookDispose = hookDispose
       agentState.hookAttached = true
       diag(`assemble-hook-attached sid=${sessionId || '-'}`)
     } catch (error) {
+      agentState.hookDispose = null
       agentState.hookAttached = false
       diag(`assemble-hook-attach-failed ${error?.message ?? error}`)
     }
@@ -968,7 +1049,7 @@ export function apply(ctx, config = {}) {
         }, 150)
       })
       watcher.on?.('error', () => {})
-      trackDisposer(() => {
+      trackDisposer(storeFile, () => {
         watcher?.close?.()
         watcher = null
         if (reloadTimer) {
@@ -1733,7 +1814,7 @@ export function apply(ctx, config = {}) {
         }
       },
     })
-    trackDisposer(disposeRoute)
+    trackDisposer(storeFile, disposeRoute)
     diag('http-route-registered')
   } catch (error) {
     diag(`http-route-failed ${error?.stack ?? error}`)
@@ -1745,7 +1826,7 @@ export function apply(ctx, config = {}) {
 
   try {
     // 工具的 disposer 同样要留：热重载后旧工具不摘，宿主里就会出现两份同名工具。
-    trackDisposer(ctx.tools.register(toolDefinition))
+    trackDisposer(storeFile, ctx.tools.register(toolDefinition))
     diag('tool-registered')
   } catch (error) {
     diag(`tool-register-failed ${error?.stack ?? error}`)
@@ -1800,7 +1881,7 @@ export function apply(ctx, config = {}) {
   // 最后才把这份 store 登记给 globalThis。上面任何一步抛错时，registry 仍然指向上
   // 一个实例的文档 —— 那份虽然旧，但至少完整。如果早早就换成这次刚建的空壳，一次
   // 半途失败的 apply 会让所有还挂着的旧 hook 突然读到空文档，规则全部失效。
-  registry().state = state
+  registry(storeFile).state = state
 
   diag('apply-ready v2')
 }

@@ -242,6 +242,31 @@ test('#10 卸载时释放路由，不残留旧 handler', () => withHarness(async
   assert.equal(harness.getRoute(), null, 'dispose 后路由应被摘掉')
 }))
 
+// ------------------------------------------- 11 hook 生命周期
+
+test('#11 文档变更不会摘掉 assemble hook，动态层仍在', () => withHarness(async (harness) => {
+  const agent = harness.createAgent('s1')
+  await harness.callTool({ action: 'temp.add', id: 'keep', text: 'DYN KEEP', sessionId: 's1' })
+  const before = agent.assemble(fixture()).sections.find((s) => s.name === 'prompt-manager:temporary:keep')
+  assert.ok(before, '前置：临时条目应当通过 assemble hook 注入')
+
+  // 下面这一步会走 refreshRunningAgents → syncAgentSections。
+  // 早先 section 的 disposer 和 hook 的 disposer 共用一个 cleanups 数组，这里会把
+  // hook 一起 splice 掉；而 hookAttached 仍是 true，之后不会再挂 —— 该会话的动态层
+  // 就此永久消失（面板还照旧显示旧快照，看着像生效了）。
+  await harness.callTool({ action: 'override.set', name: 'harness:identity', mode: 'disable' })
+
+  const after = agent.assemble(fixture()).sections.find((s) => s.name === 'prompt-manager:temporary:keep')
+  assert.ok(after, '同步静态 section 时不能连带摘掉 assemble hook')
+}))
+
+test('#11 卸载后路由与工具都被释放', () => withHarness(async (harness) => {
+  assert.ok(harness.getRoute(), '注册后应有路由')
+  assert.ok(harness.getTool(), '注册后应有工具')
+  harness.emit('dispose')
+  assert.equal(harness.getRoute(), null, '卸载后路由必须摘掉，否则它一直应答且没有鉴权')
+}))
+
 // ------------------------------------------------ 9 快照脚本（静态检查）
 
 test('#9 快照脚本走 assembled 端点并写入被忽略的目录', () => {
