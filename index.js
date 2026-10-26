@@ -123,6 +123,40 @@ function currentState(fallback) {
 }
 
 /**
+ * 把临时文件挪到正式位置。
+ *
+ * Windows 上目标被杀软、搜索索引或另一个句柄短暂占用时，rename 会抛
+ * EPERM/EBUSY/EACCES —— 而这时内容其实已经完整落进临时文件了。这类占用多半是
+ * 毫秒级的，所以先短暂重试几次再说，原来一次失败就放弃太急。
+ *
+ * **不能**在重试耗尽后退化成「直接覆盖写」。那等于把原子替换降级成截断 + 顺序写：
+ * 崩溃就留下半截 JSON，而 loadStore 解析失败会退回空文档，用户下一次操作再拿空
+ * 文档整份写回，把坏文件连同可能还能抢救的内容一起覆盖 —— 一次写失败变成整份
+ * 配置永久丢失。宁可这次保存失败、保留完好的临时文件。
+ *
+ * 放在模块级是为了能被测试直接调用：这层重试的分支（第几次成功、非瞬时错误、
+ * 重试耗尽）在真实文件系统上几乎撞不到，只能靠注入假的 rename 覆盖。
+ */
+async function commitTemp(tempFile, targetFile, renameImpl = rename) {
+  let lastError = null
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    try {
+      await renameImpl(tempFile, targetFile)
+      return
+    } catch (error) {
+      lastError = error
+      const transient = error?.code === 'EPERM' || error?.code === 'EBUSY' || error?.code === 'EACCES'
+      if (!transient) throw error
+      // 最后一次失败就没必要再等了，直接收工。
+      if (attempt === 3) break
+      // 25ms、50ms、75ms —— 够杀软扫完一个小 JSON，又不会让界面明显卡住。
+      await sleep(25 * (attempt + 1))
+    }
+  }
+  throw lastError
+}
+
+/**
  * per-agent 状态的载体。
  *
  * 挂在 agent 对象上（Symbol 键）而不是 apply 闭包里：热重载会重新求值整个模块，
@@ -186,8 +220,6 @@ export function apply(ctx, config = {}) {
   }
   const storeFile = (config && config.storeFile) || join(dshHome(), 'prompt-manager.json')
   const state = { document: emptyDocument() }
-  // 登记给 globalThis：热重载后仍留在 agent 上的旧 hook 从这里取到最新的 store。
-  registry().state = state
   const runningAgents = new Map()
   const sessionFacts = new Map()
   // 最近一次真实装配的内容，按 sessionId 存放，供面板枚举 agent 作用域的段落。
@@ -486,7 +518,17 @@ export function apply(ctx, config = {}) {
         state.document = emptyDocument()
         return state.document
       }
-      log(`load-failed ${error?.message ?? error}`)
+      // 解析失败时不能静默退回空文档：插件会带着空配置继续跑，用户下一次点任何
+      // 东西都拿空文档整份写回，把那个坏掉、但可能还抢救得出来的文件彻底覆盖。
+      // 先把原文件挪到一边留证据，再退回空文档。
+      const backup = `${storeFile}.corrupt-${Date.now().toString(36)}`
+      try {
+        await rename(storeFile, backup)
+        log(`load-failed ${error?.message ?? error}；原文件已保留为 ${backup}`)
+      } catch (moveError) {
+        log(`load-failed ${error?.message ?? error}；隔离原文件失败 ${moveError?.message ?? moveError}`)
+      }
+      state.document = emptyDocument()
       return state.document
     }
   }
@@ -496,44 +538,36 @@ export function apply(ctx, config = {}) {
     const payload = `${JSON.stringify(normalized, null, 2)}\n`
     // 先写临时文件再原子替换：直接覆盖的话，写到一半出错会留下半截 JSON，
     // 下次启动就整份读不出来。rename 在同一个卷上是原子的。
-    const tempFile = `${storeFile}.${process.pid}-${Date.now().toString(36)}.tmp`
+    // 文件名带随机段：热重载时新旧两个实例的 pid 相同，光靠毫秒时间戳可能撞名，
+    // 撞上就是一方把另一方的临时文件 rename 走，结果「报失败其实已经落盘」。
+    const nonce = Math.random().toString(36).slice(2, 8)
+    const tempFile = `${storeFile}.${process.pid}-${Date.now().toString(36)}-${nonce}.tmp`
     try {
       await writeFile(tempFile, payload, 'utf8')
-      await commitTemp(tempFile, payload)
-    } finally {
+    } catch (error) {
+      // 连临时文件都没写完整，留着没用。
       try {
         await unlink(tempFile)
       } catch {
-        /* rename 成功后它已经不在了 */
+        /* 可能根本没建立起来 */
       }
+      throw error
+    }
+    try {
+      await commitTemp(tempFile, storeFile)
+    } catch (error) {
+      // 特意不删临时文件：rename 失败时它是一份**完整可用**的内容，删掉等于把用户
+      // 手动恢复的唯一材料也销毁了。日志写明路径，用户照着改回正式文件即可。
+      log(`store-write-failed ${error?.code ?? ''} ${error?.message ?? error}；内容保留在 ${tempFile}`)
+      throw error
+    }
+    try {
+      await unlink(tempFile)
+    } catch {
+      /* rename 成功后它已经不在了 */
     }
     state.document = normalized
     return normalized
-  }
-
-  /**
-   * 把临时文件挪到正式位置。Windows 上目标被杀软、搜索索引或另一个句柄短暂占用时
-   * rename 会抛 EPERM/EBUSY/EACCES —— 而这时数据其实已经完整落进临时文件了。
-   * 直接抛错等于让用户「改完设置、界面报成功、实际没磁盘上没变」，静默丢配置比
-   * 牺牲一次原子性严重得多，所以分两层兜：先短暂重试 rename（多数占用是毫秒级），
-   * 还不行再退化成直接覆盖写（放弃原子性，但保证内容写进去）。
-   */
-  async function commitTemp(tempFile, payload) {
-    let lastError = null
-    for (let attempt = 0; attempt < 4; attempt += 1) {
-      try {
-        await rename(tempFile, storeFile)
-        return
-      } catch (error) {
-        lastError = error
-        const transient = error?.code === 'EPERM' || error?.code === 'EBUSY' || error?.code === 'EACCES'
-        if (!transient) throw error
-        // 25ms、50ms、75ms —— 够杀软扫完一个小 JSON，又不会让 UI 明显卡住。
-        await sleep(25 * (attempt + 1))
-      }
-    }
-    log(`store-write-retry ${lastError?.code}: rename 四次失败，退化为直接覆盖`)
-    await writeFile(storeFile, payload, 'utf8')
   }
 
   // ------------------------------------------------------------- resolution
@@ -1765,5 +1799,17 @@ export function apply(ctx, config = {}) {
     diag(`watcher-failed ${error?.stack ?? error}`)
   }
 
+  // 最后才把这份 store 登记给 globalThis。上面任何一步抛错时，registry 仍然指向上
+  // 一个实例的文档 —— 那份虽然旧，但至少完整。如果早早就换成这次刚建的空壳，一次
+  // 半途失败的 apply 会让所有还挂着的旧 hook 突然读到空文档，规则全部失效。
+  registry().state = state
+
   diag('apply-ready v2')
 }
+
+/**
+ * 测试入口。`commitTemp` 的重试分支在真实文件系统上几乎撞不到（要刚好有另一个
+ * 句柄占着目标文件），只能靠注入假的 rename 来覆盖。只暴露这一个函数，不导出
+ * 任何运行时状态。
+ */
+export const __test = { commitTemp }
