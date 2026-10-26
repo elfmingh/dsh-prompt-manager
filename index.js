@@ -71,6 +71,11 @@ function stringList(value) {
  * 模块级变量跟着换成新的空表，旧实例的 route / watcher / 定时器就再也够不着了 ——
  * 日志里那两条 "duplicate exact route" 就是这么来的。globalThis 在重载前后是同一个
  * 对象，新模块能看见旧实例留下的清理函数。
+ *
+ * 已知限制：这是**进程级**单例。同一个 Node 进程里如果同时加载两份本插件（两个
+ * profile、或宿主用 isolate 起两个 scope），后一个的 `disposeAll()` 会把前一个的
+ * 注册一起摘掉，`state` 也会互相覆盖。换成按实例隔离会让热重载失效（新 ctx 是新
+ * 对象，认不出旧实例），所以这里选了保住热重载。DSH 正常单实例运行不受影响。
  */
 const DISPOSER_REGISTRY = Symbol.for('vertixara.dsh-prompt-manager/disposers')
 
@@ -165,16 +170,6 @@ async function commitTemp(tempFile, targetFile, renameImpl = rename) {
  * 也能先把旧的那份摘干净。
  */
 const AGENT_STATE = Symbol.for('vertixara.dsh-prompt-manager/agent-state')
-const AGENT_REGISTRY = Symbol.for('vertixara.dsh-prompt-manager/agents')
-
-function liveAgents() {
-  let set = globalThis[AGENT_REGISTRY]
-  if (!set) {
-    set = new Set()
-    globalThis[AGENT_REGISTRY] = set
-  }
-  return set
-}
 
 function agentStateOf(agent) {
   if (!agent || (typeof agent !== 'object' && typeof agent !== 'function')) return null
@@ -183,8 +178,8 @@ function agentStateOf(agent) {
     state = { cleanups: [], hookAttached: false }
     try {
       agent[AGENT_STATE] = state
-      liveAgents().add(agent)
     } catch {
+      // agent 被冻结或是只读 Proxy：拿不到状态就不挂，宁可不生效也不要抛错。
       return null
     }
   }
@@ -1778,9 +1773,9 @@ export function apply(ctx, config = {}) {
         sessionFacts.delete(sessionId)
       }
       cleanupAgentSections(agent)
-      // agent 已经没了，把它从跨重载的登记表里去掉，否则下一次 apply 还会试图接管它。
+      // agent 已经没了，把状态槽一起清掉：它上面挂着的是本次 apply 的闭包，
+      // 留在对象上只会延长这一整份实例的寿命。
       if (agent) {
-        liveAgents().delete(agent)
         try {
           delete agent[AGENT_STATE]
         } catch {
