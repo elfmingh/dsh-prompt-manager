@@ -392,7 +392,15 @@ export function apply(ctx, config = {}) {
    * 收到通知 —— 于是内存里一直攥着一个已经死掉的会话对象。WeakRef 让宿主回收之后
    * 这里自然落空，deref 不出东西就等于「不在了」。
    */
-  const liveAgent = (ref) => ref?.deref?.() ?? ref ?? null
+  const liveAgent = (ref) => {
+    if (!ref) return null
+    // 必须是「是 WeakRef 就只信 deref」。写成 `ref?.deref?.() ?? ref` 是错的：
+    // Agent 被回收后 deref() 返回 undefined，`??` 会回落到 ref 本身，于是把一个
+    // WeakRef 对象当成 agent 传给 syncAgentSections / assemble 逻辑。
+    if (typeof ref.deref === 'function') return ref.deref() ?? null
+    // 不是 WeakRef 就是老数据（或测试里直接塞的对象），原样返回。
+    return ref
+  }
 
   const sessionFacts = new Map()
   // 最近一次真实装配的内容，按 sessionId 存放，供面板枚举 agent 作用域的段落。
