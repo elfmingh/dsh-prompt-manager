@@ -763,11 +763,14 @@ export function apply(ctx, config = {}) {
       sessionFacts.set(sessionId, facts)
       freezeBaseline(sessionId)
     }
-    const state = agentStateOf(agent)
-    if (!state) return
+    // 起名 agentState 而不是 state：这个函数在 apply 作用域里，外层已经有一个
+    // `state`（store 文档）。同名会把 store 遮住，将来在这里读 state.document 就会
+    // 静默拿到错误的对象。
+    const agentState = agentStateOf(agent)
+    if (!agentState) return
     // 只摘 section，保留 hookAttached：assemble hook 是独立的一次性注册，
     // 不能因为条目变化就被拆掉重挂。
-    for (const dispose of state.cleanups.splice(0)) {
+    for (const dispose of agentState.cleanups.splice(0)) {
       try {
         dispose()
       } catch {
@@ -778,7 +781,7 @@ export function apply(ctx, config = {}) {
     const items = resolveStaticItems(facts)
     for (const item of items) {
       try {
-        state.cleanups.push(agent.ctx.systemPrompt.section({
+        agentState.cleanups.push(agent.ctx.systemPrompt.section({
           name: sectionName(item.id, item.source),
           order: item.order,
           text: item.text,
