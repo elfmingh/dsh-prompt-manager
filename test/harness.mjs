@@ -261,6 +261,19 @@ export async function createHarness() {
     cleanup,
     getTool: () => tool,
     getRoute: () => route,
+    /**
+     * 模拟「从 0.2.4 升级上来」的那一刻。
+     *
+     * 0.2.4 用一个全局 Set 记住所有建过的 agent，它没有 scope、全进程一份；新版
+     * 改成 registry 里的 Map。升级时旧版根本没有这张 Map，所以这里把它清空，
+     * 再把 agent 放进旧 Set —— 只有这样才真正测得到 adoptLegacyAgents 有没有干活
+     * （否则 Map 里本来就有这些 agent，删掉迁移代码测试照样过）。
+     */
+    simulateLegacyUpgrade: (agentList) => {
+      globalThis[Symbol.for('vertixara.dsh-prompt-manager/agents')] = new Set(agentList)
+      const entry = globalThis[Symbol.for(`vertixara.dsh-prompt-manager/disposers:${storeFile}`)]
+      if (entry?.agents) entry.agents.clear()
+    },
     /** 顶层 ctx 上某个事件挂了多少个 listener（agent 自己的用 createAgent 返回值）。 */
     listenerCount: (event) => (listeners.get(event) ?? []).length,
   }

@@ -83,7 +83,7 @@ function registry(scope) {
   const key = Symbol.for(`${DISPOSER_REGISTRY_PREFIX}${scope}`)
   let entry = globalThis[key]
   if (!entry) {
-    entry = { current: null, all: new Set(), state: null, lastDocument: null, scope }
+    entry = { current: null, all: new Set(), state: null, lastDocument: null, agents: new Map(), scope }
     globalThis[key] = entry
   }
   return entry
@@ -293,7 +293,10 @@ function agentStateOf(agent) {
     // 按「已经挂了」对待，让调用方别重挂。
     state.sectionDisposers = []
     state.hookDispose = typeof state.hookDispose === 'function' ? state.hookDispose : null
-    state.hookAttached = state.hookAttached === true
+    // 注意不能写 `=== true`：那会把 undefined 变成 false，于是 syncAgentSections
+    // 末尾判定「没挂」又重挂一份，而原来那个 hook 的 disposer 还被覆盖掉 ——
+    // 两份 hook、一份丢掉清理入口。未知形状下唯一安全的方向是「当作已经挂了」。
+    state.hookAttached = state.hookAttached !== false
   }
   try {
     agent[AGENT_STATE] = state
@@ -363,7 +366,24 @@ export function apply(ctx, config = {}) {
     diag(`dispose-hook-failed ${error?.message ?? error}`)
   }
   const state = { document: emptyDocument() }
-  const runningAgents = new Map()
+  // 已建立的 agent 表挂在 registry 上，而不是每次 apply 新建一个空 Map。
+  //
+  // 热重载不会为重开的会话再发 agent/created，新实例如果从空表开始，就永远不
+  // 知道前一实例还管着哪些 agent：静态 section 停在旧文档上（动态层靠 currentState
+  // 还能读到新文档，但这只掩盖了症状），refreshRunningAgents 也刷不到它们。
+  // 早先 0.2.4 用一个 globalThis Set 兜这件事，但它是只写不读的，删掉之后就断开
+  // 了这条唯一线索 —— 现在用 registry 里这张 Map 代替，它天然跨重载存活。
+  const runningAgents = registry(storeFile).agents
+
+  /**
+   * 上一次 loadStore 是否真的拿到了可信文档。
+   *
+   * loadStore 在 I/O 失败、解析失败、归一化失败时都会「回落到当前文档」并返回
+   * 而不是抛错 —— 这是对的，装配不该因为读不到文件就崩。但调用方如果只看
+   * resolved，就分不清「读到了」和「没读到、给了个旧的」，基于错误文档去做
+   * 有永久后果的事（迁移旧 agent、冻结基线）会留下收不回来的状态。
+   */
+  let lastLoadOk = true
   const sessionFacts = new Map()
   // 最近一次真实装配的内容，按 sessionId 存放，供面板枚举 agent 作用域的段落。
   const assemblySnapshots = new Map()
@@ -641,6 +661,7 @@ export function apply(ctx, config = {}) {
   // -------------------------------------------------------------- store i/o
 
   async function loadStore() {
+    lastLoadOk = false
     // 读、解析、归一化拆成三段 try。只有「解析」失败才说明文件内容坏了；
     // 早先三者共用一个 catch，于是 EACCES / EIO 这类读取错误也会落进隔离分支，
     // 把一份刚刚保存成功的配置从正式文件上 rename 走 —— 读一次失败就能毁掉
@@ -650,7 +671,9 @@ export function apply(ctx, config = {}) {
       text = await readFile(storeFile, 'utf8')
     } catch (error) {
       if (error?.code === 'ENOENT') {
+        // 没有文件是正常状态（全新安装），算成功读到一个空仓库。
         state.document = emptyDocument()
+        lastLoadOk = true
         return state.document
       }
       // 读不到不等于内容坏了。没有证据就不许动用户的数据：保留最后一次有效
@@ -686,6 +709,7 @@ export function apply(ctx, config = {}) {
       return state.document
     }
     state.document = document
+    lastLoadOk = true
     if (!parsed || Number(parsed?.version ?? 1) < STORE_VERSION) {
       try {
         // 走 saveStore 而不是裸 writeFile：迁移同样是「覆盖用户的正式文件」，
@@ -2038,6 +2062,21 @@ function workspaceEntries(document = state.document) {
   loadStore()
     .then((document) => {
       diag(`initial-load-ok entries=${document.entries.length} temporary=${document.temporary.length}`)
+      // 没读到可信文档就不许迁移：这时 state.document 是回落值（全新安装时是空壳），
+      // 拿它去同步会把旧 agent 的静态段落按空文档重注册、再冻结一份空基线，
+      // 之后文件恢复正常也回不来 —— 磁盘上的规则还在，但没人再读它了。
+      // 保留旧的 agent 注册表，等下一次成功的加载再接。
+      if (!lastLoadOk) {
+        diag('legacy-adopt-skipped load-failed')
+        return
+      }
+      // 这个回调是异步的：等待期间实例可能已经被卸载，或者又被下一次热重载替换掉。
+      // 作废的实例不能再去动 agent —— 它注册的 hook 已经摘不掉，去重挂只会把
+      // 别人的会话弄乱，而业务上该由新实例接管这些 agent。
+      if (registry(storeFile).state !== state) {
+        diag('legacy-adopt-skipped stale-instance')
+        return
+      }
       // 文档就绪之后才收编旧 agent：syncAgentSections 要按新文档算静态层，
       // 在文档还是空壳时同步会把它们的段落注册成一份空的。
       adoptLegacyAgents()

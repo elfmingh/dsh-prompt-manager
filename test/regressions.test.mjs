@@ -9,7 +9,7 @@
  * 早前这一组用的是 `reload`，而 reload 只重读文件、实例没换，跨实例的 bug 一个都
  * 测不出来，所以那几条当时是假通过的。
  */
-import { mkdirSync, rmSync } from 'node:fs'
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createHarness, fixture } from './harness.mjs'
@@ -112,13 +112,19 @@ test('#15 卸载后路由和工具都被释放', () => withHarness(async (harnes
 test('#16 0.2.4 的旧 agent state 会被迁移，而不是在同步时抛错', () => withHarness(async (harness) => {
   const agent = harness.createAgent('s1')
   await agent.assemble(fixture())
+
+  // 0.2.4 把 hook 的 disposer 和 section 的混在同一个 cleanups 里。这里直接取
+  // 插件自己挂的那个**真** disposer 放进去 —— 要证明的正是迁移会执行它们，
+  // 手工删 listener 只能证明测试自己删得掉。
+  const realHookDispose = agent.agent[AGENT_STATE]?.hookDispose
+  assert.equal(typeof realHookDispose, 'function', '前置条件：插件此时应当已经挂上 hook')
+
   let oldHookDisposed = false
-  // 模拟旧版本留下的状态：cleanups 里混着 section 和 hook 的 disposer。
-  // 真实升级时那个 hook 会被 disposeHook 摘掉，这里用 dropListeners 复现同样的
-  // 前置条件 —— 否则真 hook 还挂着，迁移后会多出一份，测的是测试自己的构造缺陷。
-  agent.dropListeners('system-prompt/assemble')
   agent.agent[AGENT_STATE] = {
-    cleanups: [() => { oldHookDisposed = true }],
+    cleanups: [
+      () => { oldHookDisposed = true },
+      realHookDispose,
+    ],
     hookAttached: true,
   }
 
@@ -164,5 +170,58 @@ test('#17 热重载后新配置的工作区对旧 agent 也生效', () => withHa
   assert.ok(
     names.includes('prompt-manager:hot'),
     `重载后新增的工作区条目应当出现在旧 agent 的装配里，实际：${names.join(',')}`,
+  )
+}))
+
+test('#18 升级时从 0.2.4 的 agent Set 收编已有会话', () => withHarness(async (harness) => {
+  const agent = harness.createAgent('s1', 'D:/work')
+  await agent.assemble(fixture())
+
+  // 造出 0.2.4 的升级现场：state 是旧形状、hook 记作已挂，agent 只留在旧版那个
+  // 全局 Set 里，而新版的 agents 表是空的（旧版根本没有这张表）。
+  agent.agent[AGENT_STATE] = { cleanups: [], hookAttached: true }
+  harness.simulateLegacyUpgrade([agent.agent])
+
+  await harness.reapply()
+
+  // 被收编的证据：之后应用到全局的库条目要**重新注册**到这个旧 agent 上。
+  // 只看装配结果不够 —— 动态 hook 靠 currentState 本来就能读到新文档，但静态段落
+  // 是注册制，agent 不在 runningAgents 里就永远停在旧内容上。
+  await harness.callTool({ action: 'library.add', id: 'after', text: '升级后新增' })
+  await harness.callTool({ action: 'apply.toggle', id: 'after', scope: 'global', enabled: true })
+  const registered = [...(agent.staticSections ?? [])].map((s) => s?.name)
+  assert.ok(
+    registered.includes('prompt-manager:after'),
+    `旧 agent 应当被新实例接管并重新注册静态段落，实际：${registered.join(',') || '(空)'}`,
+  )
+}))
+
+test('#19 首次读取失败时不迁移，保住旧 agent 注册表', () => withHarness(async (harness) => {
+  const agent = harness.createAgent('s1')
+  await agent.assemble(fixture())
+  const hooksBefore = agent.listenerCount('system-prompt/assemble')
+
+  agent.agent[AGENT_STATE] = { cleanups: [], hookAttached: true }
+  harness.simulateLegacyUpgrade([agent.agent])
+
+  // 让首次加载失败。用坏 JSON 而不是把 storeFile 换成目录：两者都走「没拿到
+  // 可信文档」的回落分支，但后者在 Windows 上会让 watcher 和 cleanup 互相卡住，
+  // 测试直接挂死（已验证过）。
+  writeFileSync(harness.storeFile, '{ 这不是合法 JSON', 'utf8')
+
+  await harness.reapply()
+
+  // 读失败时不许迁移。迁移要按新文档重注册静态段落、还会冻结一份基线；
+  // 如果此刻手里只有回落出来的空文档，这些动作会把会话永久压成空配置 ——
+  // 之后文件恢复正常也不会自己回来。所以旧注册表要留着，等下次成功加载再接管。
+  assert.equal(
+    globalThis[Symbol.for('vertixara.dsh-prompt-manager/agents')]?.size,
+    1,
+    '读取失败时应当保留 0.2.4 的 agent 注册表，留给下一次成功的加载',
+  )
+  assert.equal(
+    agent.listenerCount('system-prompt/assemble'),
+    hooksBefore,
+    '读取失败时不应摘掉或重挂 hook',
   )
 }))
