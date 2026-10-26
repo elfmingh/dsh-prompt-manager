@@ -95,19 +95,30 @@ function registry(scope) {
   if (!('lastDocument' in entry)) entry.lastDocument = null
   if (!('state' in entry)) entry.state = null
   if (!('current' in entry)) entry.current = null
-  // 值也要迁移：更早的版本（6c98aca 及之前）往这张表里存的是**裸 agent**，
-  // 不是 WeakRef。只把它当 WeakRef 解引用而不回写，等于强引用照旧攥着 ——
-  // WeakRef 想解决的泄漏一点没变。这里就地包一层，幂等。
+  return entry
+}
+
+/**
+ * 把表里继承下来的**裸 agent** 就地包成 WeakRef。
+ *
+ * 更早的版本（6c98aca 及之前）存的是裸对象；只把它当 WeakRef 解引用而不回写，
+ * 等于强引用照旧攥着，WeakRef 要解决的泄漏一点没变。
+ *
+ * 只在 `apply` 初始化时调一次，**不要**放进 `registry()`：那个函数每次读取
+ * registry 都会走一遍（`currentState` → 每次提示词装配），塞进去就变成每次装配
+ * 全表扫描一次 —— 会话越多越慢，而且这份迁移本质上只需要在上电时跑一次。
+ */
+function migrateAgentTable(entry) {
+  if (!(entry?.agents instanceof Map)) return
   for (const [sessionId, value] of [...entry.agents]) {
     if (!value || typeof value.deref === 'function') continue
     try {
       entry.agents.set(sessionId, new WeakRef(value))
     } catch {
-      // 不可弱引用的值（原始类型之类）直接丢掉，留着也没有意义。
+      // 不可弱引用的值（原始类型之类）留着也没有意义。
       entry.agents.delete(sessionId)
     }
   }
-  return entry
 }
 
 /**
@@ -395,6 +406,8 @@ export function apply(ctx, config = {}) {
   // 早先 0.2.4 用一个 globalThis Set 兜这件事，但它是只写不读的，删掉之后就断开
   // 了这条唯一线索 —— 现在用 registry 里这张 Map 代替，它天然跨重载存活。
   const runningAgents = registry(storeFile).agents
+  // 只在启动时做一次裸值 → WeakRef 的迁移，不要放进 registry()（那儿是热路径）。
+  migrateAgentTable(registry(storeFile))
 
   /**
    * 表里存的是 WeakRef 而不是 agent 本身。
