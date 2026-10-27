@@ -95,6 +95,12 @@ function registry(scope) {
   if (!('lastDocument' in entry)) entry.lastDocument = null
   if (!('state' in entry)) entry.state = null
   if (!('current' in entry)) entry.current = null
+  // 写事务队列也必须跨 apply 共用，理由和 agents 表一样：热重载不会停止旧实例
+  // 已经在跑的操作，而新实例如果另起一条队列，两边就会同时往同一个 storeFile 写。
+  // 队列跟着 registry 走，才有「同一份存储文件全局串行」这回事。
+  if (!entry.writeQueue || typeof entry.writeQueue !== 'object') {
+    entry.writeQueue = { chain: Promise.resolve() }
+  }
   return entry
 }
 
@@ -366,9 +372,20 @@ function releaseAgent(agent) {
   agentState.hookAttached = false
 }
 
+/**
+ * 存储用到的全部文件系统操作，集中一处以便注入。
+ *
+ * 生产路径就是 node:fs/promises 的原始函数。测试需要把某次 rename 或 readFile
+ * 「暂停在半路」才能复现交错，而直接 import 的模块没法替换 —— 更重要的是，靠
+ * sleep 猜时序写出来的并发测试既不稳定也证明不了什么。允许 apply 传入替身，
+ * 才能用屏障精确地在某个操作前后卡住、断言此刻另一个操作看到了什么。
+ */
+const defaultIo = { readFile, writeFile, rename, unlink }
+
 export function apply(ctx, config = {}) {
   // 实例标识要在清理之前算出来：注册表按它分槽，不同实例互不干扰。
   const storeFile = (config && config.storeFile) || join(dshHome(), 'prompt-manager.json')
+  const io = (config && config.io) || defaultIo
   // 上一次 apply 的残留先摘掉，否则注册同一路径会抛 duplicate route。
   disposeAll(storeFile)
   // 从 0.2.4 热重载上来时，旧实例的清理函数在另一张（无后缀的）表里，只清本实例
@@ -427,6 +444,15 @@ export function apply(ctx, config = {}) {
     return ref
   }
 
+  /**
+   * 不写盘的动作。加载失败时这些仍然可以执行 —— 展示一份旧快照是安全的，
+   * 拿旧快照整份回写才是危险的。
+   *
+   * `reload` 也在此列：它不改文档，而且它恰恰是「重新读一次、说不定就好了」的
+   * 那条路，挡掉它等于把用户自救的唯一入口也关了。
+   */
+  const READONLY_ACTIONS = new Set(['list', 'preview', 'path', 'reload'])
+
   const sessionFacts = new Map()
   // 最近一次真实装配的内容，按 sessionId 存放，供面板枚举 agent 作用域的段落。
   const assemblySnapshots = new Map()
@@ -435,19 +461,96 @@ export function apply(ctx, config = {}) {
   let watcher = null
   let reloadTimer = null
   /**
+   * 排队等待的上限。
+   *
+   * 队列本来没有上限：一个卡住的 I/O 会让后面所有请求无限期挂着，调用方（HTTP
+   * 客户端、面板）看到的是「没有响应」而不是「失败了」，这比失败更难排查。
+   * 给排队加期限后，等太久会明确报错。
+   *
+   * 注意它只约束**还没开始**的事务。已经开始的事务不受它约束 —— 见下面的实现。
+   */
+  const WRITE_QUEUE_WAIT_MS =
+    Number(config?.writeQueueWaitMs) > 0 ? Number(config.writeQueueWaitMs) : 10_000
+
+  /**
    * 写事务队列。
    *
    * 每次修改都是「读整份文档 → 改 → 整份写回」。两个调用并发时，它们各自读到
    * 同一个旧版本，先后写回，后写的那次把先写的成果整个抹掉，而两边都拿到成功
    * 响应。做法是把整个事务串起来，且在锁内重新读盘，保证基于最新状态修改。
+   *
+   * 队列本身挂在 registry 上而不是这个闭包里（见 registry 里的 writeQueue）：
+   * 闭包随热重载重建，而旧实例在途的操作不会因为一次 dispose 就停下。
+   *
+   * ## 超时的正确做法
+   *
+   * 排队超时**不能**只用 Promise.race 提前 reject 就完事：那样调用方已经收到
+   * 「失败」，可队列里的任务还排着，轮到它时照样跑、照样写盘 —— 结果就是
+   * 「报了失败，文件却变了」，比直接不超时更糟。
+   *
+   * 所以这里给任务一个 cancelled 标志：超时把它置上，任务真正轮到时看到它就直接
+   * 放弃，绝不执行。已经开始的（started）不受超时影响，也不强行解锁。
    */
-  let writeChain = Promise.resolve()
+  function withWriteLock(task, { allowUnpublished = false, waitMs = WRITE_QUEUE_WAIT_MS } = {}) {
+    const queue = registry(storeFile).writeQueue
+    let started = false
+    let cancelled = false
+    let timer = null
 
-  function withWriteLock(task) {
-    const run = writeChain.then(() => task())
+    const queued = queue.chain.then(async () => {
+      if (cancelled) {
+        // 已经超时了。即使现在轮到，也绝不执行。
+        const error = new Error('写事务排队超时，未执行')
+        error.code = 'WRITE_QUEUE_TIMEOUT'
+        throw error
+      }
+      started = true
+      // 一旦真的开始，排队就不是它的问题了，停表。
+      if (timer) clearTimeout(timer)
+      timer = null
+
+      // 排队期间实例可能已经被热重载替换掉。作废的实例**不得再开始**新事务：
+      // 它手里那份文档是旧的，写下去会把新实例刚保存的内容覆盖掉，而它还会
+      // 报成功。在途的（已经开始跑的）事务不打断，让它自然结束。
+      //
+      // owner 为 null 有两种含义，必须区分：
+      //   - 当前实例正在初始化（apply 还没走到末尾发布 state）：首次加载属于这种，
+      //     放行 —— 否则 bootstrap 会把自己拦在门外。
+      //   - 旧实例已被 disposeAll 清掉 state：它此刻的 task 一定已经作废，
+      //     拦住 —— 这正是要防的那条。
+      // 两者只能靠调用方声明区分，所以 allowUnpublished 只给首次加载用。
+      const owner = registry(storeFile).state
+      if (owner !== state && !(allowUnpublished && owner === null)) {
+        const error = new Error('写事务所属的实例已被替换')
+        error.code = 'STALE_INSTANCE'
+        throw error
+      }
+      return task()
+    })
     // 队列本身不能被 rejection 打断，否则一个失败会毒化后续所有写。
-    writeChain = run.then(() => {}, () => {})
-    return run
+    queue.chain = queued.then(() => {}, () => {})
+    // race 输掉之后 queued 仍会继续跑到底，没人接它的 rejection 就会变成
+    // unhandled rejection。这里挂一个空处理器把它吃掉。
+    queued.catch(() => {})
+
+    if (!(waitMs > 0)) return queued
+
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        // 已经开始的不受约束：它可能只是慢，而不是排队。
+        if (started) return
+        cancelled = true
+        const error = new Error(`写事务排队超过 ${waitMs}ms`)
+        error.code = 'WRITE_QUEUE_TIMEOUT'
+        reject(error)
+      }, waitMs)
+      timer.unref?.()
+    })
+
+    return Promise.race([queued, timeout]).finally(() => {
+      if (timer) clearTimeout(timer)
+      timer = null
+    })
   }
 
   // ------------------------------------------------------------ diagnostics
@@ -703,7 +806,7 @@ export function apply(ctx, config = {}) {
 
   // -------------------------------------------------------------- store i/o
 
-  async function loadStore() {
+  async function loadStoreInner({ isolate = false } = {}) {
     // 返回 { document, ok }，ok 表示**这一次**加载是否真的拿到了可信文档。
     //
     // 不能用实例级变量记这个：首次加载、watcher、工具动作会并发跑，一次失败
@@ -713,9 +816,14 @@ export function apply(ctx, config = {}) {
     // 早先三者共用一个 catch，于是 EACCES / EIO 这类读取错误也会落进隔离分支，
     // 把一份刚刚保存成功的配置从正式文件上 rename 走 —— 读一次失败就能毁掉
     // 正常运行的配置，这比它想防的问题严重得多。
+    //
+    // 调用方**必须已经持有写事务队列**（见下面的 loadStore / loadStoreFirst）。
+    // 加载不只是读：解析失败可能把文件 rename 走，格式升级会调 saveStore 整份
+    // 重写，而任何一步都会发布 state.document。把它当纯读放在锁外，就是让
+    // 「搬走用户的文件」和别人的保存交错。
     let text
     try {
-      text = await readFile(storeFile, 'utf8')
+      text = await io.readFile(storeFile, 'utf8')
     } catch (error) {
       if (error?.code === 'ENOENT') {
         // 没有文件是正常状态（全新安装），算成功读到一个空仓库。
@@ -734,15 +842,23 @@ export function apply(ctx, config = {}) {
     } catch (error) {
       // 到这里才是真的解析不了。不能静默退回空文档：插件会带着空配置继续跑，
       // 用户下一次点任何东西都拿空文档整份写回，把那个坏掉、但可能还抢救得
-      // 出来的文件彻底覆盖。先把原文件挪到一边留证据，再退回空文档。
-      const backup = `${storeFile}.corrupt-${Date.now().toString(36)}`
-      try {
-        await rename(storeFile, backup)
-        log(`store-corrupt ${error?.message ?? error}；原文件已保留为 ${backup}`)
-      } catch (moveError) {
-        log(`store-corrupt ${error?.message ?? error}；隔离原文件失败 ${moveError?.message ?? moveError}`)
+      // 出来的文件彻底覆盖。
+      //
+      // 隔离（把原文件挪到一边）只允许在首次加载时做：那时是启动抢救，持锁且
+      // 没有并发写。运行中被 watcher 触发的加载一律不隔离 —— 一次读到坏内容
+      // 就把文件搬走，风险远大于收益，记日志等下一次成功读取即可。
+      if (isolate) {
+        const backup = `${storeFile}.corrupt-${Date.now().toString(36)}`
+        try {
+          await io.rename(storeFile, backup)
+          log(`store-corrupt ${error?.message ?? error}；原文件已保留为 ${backup}`)
+        } catch (moveError) {
+          log(`store-corrupt ${error?.message ?? error}；隔离原文件失败 ${moveError?.message ?? moveError}`)
+        }
+        state.document = emptyDocument()
+      } else {
+        log(`store-corrupt(no-isolate) ${error?.message ?? error}`)
       }
-      state.document = emptyDocument()
       return { document: state.document, ok: false }
     }
 
@@ -768,6 +884,23 @@ export function apply(ctx, config = {}) {
     return { document: state.document, ok: true }
   }
 
+  /**
+   * 加载并发布文档。**所有不在写事务里的调用方都走这里**（watcher / HTTP GET）。
+   *
+   * 加载不是纯读：解析失败可能搬走文件，格式升级会整份重写，任何一步都会发布
+   * state.document。放进同一个写事务队列，才能保证它不和别人的保存交错。
+   */
+  function loadStore() {
+    return withWriteLock(() => loadStoreInner({ isolate: false }))
+  }
+
+  /**
+   * 首次加载。唯一允许隔离坏文件的入口 —— 启动抢救时持锁且没有并发写。
+   */
+  function loadStoreFirst() {
+    return withWriteLock(() => loadStoreInner({ isolate: true }), { allowUnpublished: true })
+  }
+
   async function saveStore(document) {
     const normalized = normalizeDocument(document)
     const payload = `${JSON.stringify(normalized, null, 2)}\n`
@@ -778,18 +911,24 @@ export function apply(ctx, config = {}) {
     const nonce = Math.random().toString(36).slice(2, 8)
     const tempFile = `${storeFile}.${process.pid}-${Date.now().toString(36)}-${nonce}.tmp`
     try {
-      await writeFile(tempFile, payload, 'utf8')
+      // flush: true 让 Node 在写完后请求把文件缓存刷到存储设备上，再关闭句柄。
+      // 不这样做的话，rename 完成时内容可能还停在页缓存里：掉电会留下一个
+      // 「名字对了、内容是空的或半截」的正式文件，比根本没有这个文件更糟。
+      //
+      // 它提供的是「请求刷新」语义 —— 具体保证到什么程度取决于操作系统、文件系统
+      // 和存储设备。Node 的 rename 走 MoveFileExW(REPLACE_EXISTING)，不带
+      // MOVEFILE_WRITE_THROUGH，所以目录项本身仍不因此获得断电保证。
+      await io.writeFile(tempFile, payload, { encoding: 'utf8', flush: true })
     } catch (error) {
-      // 连临时文件都没写完整，留着没用。
-      try {
-        await unlink(tempFile)
-      } catch {
-        /* 可能根本没建立起来 */
-      }
+      // 这里**不再删临时文件**。写失败有两种：内容根本没写完，和内容写完了但
+      // flush 没成功。后者手里是一份完整可用的数据，删掉等于销毁唯一的恢复材料；
+      // 前者留下的半截文件不会造成伤害（正式文件还没动）。两种都留给用户判断，
+      // 日志带上路径。
+      log(`store-temp-write-failed ${error?.code ?? ''} ${error?.message ?? error}；内容可能留在 ${tempFile}`)
       throw error
     }
     try {
-      await commitTemp(tempFile, storeFile)
+      await commitTemp(tempFile, storeFile, io.rename)
     } catch (error) {
       // 特意不删临时文件：rename 失败时它是一份**完整可用**的内容，删掉等于把用户
       // 手动恢复的唯一材料也销毁了。日志写明路径，用户照着改回正式文件即可。
@@ -797,7 +936,7 @@ export function apply(ctx, config = {}) {
       throw error
     }
     try {
-      await unlink(tempFile)
+      await io.unlink(tempFile)
     } catch {
       /* rename 成功后它已经不在了 */
     }
@@ -1408,7 +1547,21 @@ function workspaceEntries(document = state.document) {
       // 所有 action 串行执行，并在锁内重新读盘：并发调用若各自基于内存里的同一份
       // 旧文档修改再写回，就会互相覆盖——两边都返回成功，却只剩一个结果。
       return withWriteLock(async () => {
-        const { ok } = await loadStore()
+        // 用 Inner：这里已经持锁，再调 loadStore() 会把自己排到自己后面，永远等下去。
+        const { ok } = await loadStoreInner()
+        // 读不到可信文档时，只允许「看」，不允许「改」。
+        //
+        // 失败时 state.document 是回落的旧值（或空壳）。这时候如果照常执行修改，
+        // 就会拿这份旧的整份写回磁盘 —— 一次读取故障就能把用户真实的数据覆盖掉，
+        // 而磁盘上那份原本是好的。看旧快照是安全的，拿旧快照回写不是。
+        const action = String(args?.action ?? 'list').toLowerCase()
+        if (!ok && !READONLY_ACTIONS.has(action)) {
+          const error = new Error(
+            `配置读取失败，已拒绝「${action}」以免用旧快照覆盖磁盘上的数据；请检查存储文件后重试`,
+          )
+          error.code = 'STORE_UNREADABLE'
+          throw error
+        }
         // 首次加载失败时会跳过升级迁移；之后任何一次成功加载都该把这次接管补上，
         // 否则旧 agent 的静态段落一直停在旧文档上，直到下一次 apply 才恢复。
         // adoptLegacyAgents 幂等：旧 Set 消费过之后就是空转。
@@ -1425,7 +1578,8 @@ function workspaceEntries(document = state.document) {
         return `${storeFile}\n(${summary()})`
       }
       if (action === 'reload') {
-        const { ok } = await loadStore()
+        // runAction 只在工具入口的写事务里被调用，同样用 Inner。
+        const { ok } = await loadStoreInner()
         if (ok) adoptLegacyAgents()
         refreshRunningAgents()
         return `已重新载入：${summary()}`
@@ -2125,7 +2279,7 @@ function workspaceEntries(document = state.document) {
     diag(`tool-register-failed ${error?.stack ?? error}`)
   }
 
-  loadStore()
+  loadStoreFirst()
     .then(({ document, ok }) => {
       diag(`initial-load-ok entries=${document.entries.length} temporary=${document.temporary.length}`)
       // 没读到可信文档就不许迁移：这时 state.document 是回落值（全新安装时是空壳），

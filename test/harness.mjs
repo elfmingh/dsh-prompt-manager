@@ -6,9 +6,14 @@
  * 存储读写、静态注册、assemble waterfall 改写和 HTTP 端点，不需要起 DSH 进程。
  */
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { readFile, writeFile, rename, unlink } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply } from '../index.js'
+import { createIoBarrier } from './io-barrier.mjs'
+
+/** 与 index.js 的默认 io 一致：真实文件系统。 */
+const defaultIo = { readFile, writeFile, rename, unlink }
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -32,11 +37,15 @@ export function fixture() {
   }
 }
 
-export async function createHarness() {
+export async function createHarness(options = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-prompt-manager-'))
   // diag() 会往 $DSH_HOME/prompt-manager-debug.log 追加，指到临时目录避免污染真实日志。
   process.env.DSH_HOME = dir
   const storeFile = join(dir, 'prompt-manager.json')
+  // 允许测试注入 I/O 替身（见 io-barrier.mjs）。默认也包一层屏障但从不暂停，
+  // 这样测试随时能 pause() 某个操作，或者直接换掉某个实现来注入故障。
+  const barrier = options.barrier ?? createIoBarrier(options.baseIo ?? defaultIo)
+  const io = barrier.io
 
   const listeners = new Map()
   const cwdBySession = new Map()
@@ -98,7 +107,7 @@ export async function createHarness() {
     },
   }
 
-  apply(ctx, { storeFile })
+  apply(ctx, { ...(options.config ?? {}), storeFile, io })
   // apply() 里的首次 loadStore 是异步的；reload 会 await 一次完整加载。
   try {
     await tool.execute({ action: 'reload' })
@@ -236,7 +245,7 @@ export async function createHarness() {
   const cleanup = () => rmSync(dir, { recursive: true, force: true })
 
   /**
-   * 再跑一次 apply(ctx, { storeFile }) —— 这就是宿主热重载真正做的事：整个模块
+   * 再跑一次 apply(ctx, { ...(options.config ?? {}), storeFile, io }) —— 这就是宿主热重载真正做的事：整个模块
    * 重新求值，apply 再执行一遍，旧实例的清理函数被调掉、新实例重新注册路由与工具。
    *
    * 注意它和 `callTool({action:'reload'})` 不是一回事：reload 只是重新读一遍文件，
@@ -244,7 +253,7 @@ export async function createHarness() {
    * 用它根本测不出来 —— 以前几个用例就是这么假通过的。
    */
   const reapply = async () => {
-    apply(ctx, { storeFile })
+    apply(ctx, { ...(options.config ?? {}), storeFile, io })
     // apply 里的首次 loadStore 是异步的，等它落地再往下走。
     await delay(40)
   }
@@ -252,6 +261,7 @@ export async function createHarness() {
   return {
     dir,
     storeFile,
+    barrier,
     callTool,
     callHttp,
     createAgent,

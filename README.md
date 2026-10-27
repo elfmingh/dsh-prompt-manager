@@ -354,6 +354,25 @@ node scripts/find-in-asar.mjs "要搜的文本" [前后字符数]               
 - 面板显示的 tools 数量取决于目标会话是否产生过装配
 - `complete` 段落会在 waterfall 之后被框架还原，对它做改写无效（当前环境未观测到）
 
+### 存储与并发 · Storage and concurrency
+
+- **同一个存储文件只允许一个写入进程。** 插件用「临时文件 + rename」保证单进程内的原子替换，
+  并让全部读写事务走同一条队列，但**没有**跨进程互斥。同时跑两个 DSH 实例并指向同一个
+  `prompt-manager.json`，两边会互相覆盖。需要多进程时请各自用不同的 `storeFile`。
+- **排队有期限。** 写入要排队；等了 10 秒还没轮到的请求会明确失败（`WRITE_QUEUE_TIMEOUT`），
+  而不是无限期挂着。已经开始执行的事务不受这个期限约束，会正常跑完。
+- **读不到配置时拒绝修改。** 存储文件读取失败时，界面仍会展示最后一次成功读到的内容，
+  但所有修改动作会被拒绝（`STORE_UNREADABLE`）—— 否则会拿旧内容整份写回，把磁盘上
+  可能还完好的数据覆盖掉。
+- **`.tmp` 文件需要手工清理。** 保存是先写 `<storeFile>.<pid>-<ts>-<nonce>.tmp` 再 rename。
+  rename 失败时这份临时文件会被**故意保留**（它是唯一一份完整可用的内容）。确认自己
+  不需要之后，手工删掉即可；插件不会自动清理，因为无法可靠判断某个临时文件是否还属于
+  一个正在进行的事务。
+- **`.corrupt-*` 是抢救记录。** 首次加载时如果存储文件无法解析，它会被改名成
+  `<storeFile>.corrupt-<时间戳>` 留证据。确认内容没用了再手工删。
+- 写入使用 `flush: true` 请求把内容刷到存储设备，降低掉电后留下空文件或半截文件的可能。
+  这**不是**断电保证：目录项的持久化取决于操作系统与文件系统。
+
 **English:**
 
 - Static entries cannot reach an agent that is already running; only rebuilding the session helps
@@ -362,6 +381,12 @@ node scripts/find-in-asar.mjs "要搜的文本" [前后字符数]               
 - Tool descriptions are read-only: changing them means mutating `assembly.tools`, which is too risky and stays closed
 - The tool count shown in the panel depends on whether that session has ever assembled
 - The `complete` section is restored by the framework after the waterfall, so rewriting it has no effect (not observed in this environment)
+- **One writer process per store file.** Atomic replacement is guaranteed within a single process, and every read/write transaction shares one queue, but there is **no** cross-process lock. Two DSH instances pointed at the same `prompt-manager.json` will overwrite each other; give each its own `storeFile`.
+- **Queuing is bounded.** A write that has not started within 10 s fails with `WRITE_QUEUE_TIMEOUT` instead of hanging. A transaction that has already started is never cut off.
+- **Unreadable store refuses writes.** When the store cannot be read, the UI keeps showing the last successfully loaded content but every mutating action is rejected with `STORE_UNREADABLE` — otherwise the stale copy would be written back over data that may still be intact.
+- **`.tmp` files need manual cleanup.** Saves write `<storeFile>.<pid>-<ts>-<nonce>.tmp` and then rename. A failed rename deliberately keeps that file (it is the only complete copy). Delete it by hand once you are sure it is not needed; the plugin does not auto-prune, because it cannot reliably tell whether a temp file still belongs to a running transaction.
+- **`.corrupt-*` files are rescue evidence.** An unparseable store is renamed to `<storeFile>.corrupt-<timestamp>` on first load. Delete it by hand when you are done with it.
+- Writes use `flush: true` to ask the OS to push content to the storage device, which reduces the chance of an empty or half-written file after power loss. This is **not** a power-failure guarantee: directory-entry durability depends on the OS and filesystem.
 
 ## 👤 作者 · Author
 
