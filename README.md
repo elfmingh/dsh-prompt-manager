@@ -282,6 +282,8 @@ HTTP 端点挂在 `/prompt-manager/api`，都接受 `sessionId`：
 
 **The route mounts directly on the host's `webServer`.** The host offers no central authentication or origin policy, so the plugin enforces its own:
 
+- **`Host` 必须是回环地址**（`127.0.0.1` / `localhost` / `[::1]`，可带端口）—— 这一条挡的是 DNS rebinding：攻击者把自己的域名解析到 `127.0.0.1`，让用户浏览器朝本机端口发请求，此时 `Host` 和 `Origin` 都是攻击者的域名、二者自洽，只比较同源的检查会全部放行。`Host` 由浏览器按实际目标填写，页面脚本改不了它，所以校验 `Host` 是可靠判据。
+  / **`Host` must be a loopback address** (`127.0.0.1` / `localhost` / `[::1]`, port optional). This blocks DNS rebinding: an attacker points their domain at `127.0.0.1`, the browser then sends both `Host` and `Origin` as that domain, so a same-origin-only check passes everything. The browser fills `Host` from the real destination and page scripts cannot forge it, which makes it the reliable signal.
 - 带 `Origin` 且与 `Host` 不同源 → `403` / `Origin` present and not same-origin with `Host` → `403`
 - 写操作必须是 `content-type: application/json` —— 跨站的「简单请求」发不出这个类型，浏览器会先预检，而本路由不返回任何 CORS 响应头，预检必然失败 / Writes must be `content-type: application/json` — a cross-site "simple request" cannot send that type, the browser preflights first, and with no CORS headers on this route the preflight always fails
 - 请求体上限 1 MB / 1 MB body cap
@@ -289,6 +291,21 @@ HTTP 端点挂在 `/prompt-manager/api`，都接受 `sessionId`：
 挡不住的是本机任意进程：它本来就能直接读 `$DSH_HOME/prompt-manager.json`。这里防的是浏览器跨站。
 
 **What this does not stop is any local process:** it can read `$DSH_HOME/prompt-manager.json` directly anyway. The guard is aimed at cross-site browser requests.
+
+**如果你的界面不是从回环地址打开的**（局域网 IP、反向代理、容器里映射出来的主机名），上面第一条会把你自己的正常请求也挡掉，需要把那个主机名加进白名单：
+
+**If you open the UI from something other than a loopback address** (a LAN IP, a reverse proxy, a hostname mapped out of a container), the first rule will block your own legitimate requests too. Add the hostname to the allowlist:
+
+```yml
+# profile 的 bundle patch 里，和 storeFile 同级
+config:
+  allowedHosts:
+    - 127.0.0.1
+    - localhost
+    - my-dsh-box.lan      # 你实际访问用的主机名
+```
+
+只加主机名，不要带协议和路径；端口会被自动忽略。
 
 ## 🛠️ 开发 · Development
 

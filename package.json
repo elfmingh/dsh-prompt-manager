@@ -1,6 +1,6 @@
 {
   "name": "@vertixara/dsh-prompt-manager",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "DeepSeek Harness 的分层提示词管理器：全局、工作区、会话级提示词档案，内置段落与上下文的禁用/覆盖，子代理作用域，以及完整的 Web 管理界面。",
   "author": "Vertixara <public@vertixara.com> (https://github.com/elfmingh)",
   "license": "MIT",

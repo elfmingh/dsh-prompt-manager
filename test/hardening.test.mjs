@@ -245,3 +245,33 @@ test('#24b 写临时文件时请求刷新到存储设备', () => withHarness(asy
   assert.ok(tempWrite, '应当先写临时文件再 rename')
   assert.equal(tempWrite.options?.flush, true, '必须请求把内容刷到存储设备')
 }))
+
+// ---------------------------------------------------------------- 端点安全
+// DNS rebinding：攻击者把自己的域名解析到 127.0.0.1，让用户浏览器朝本机端口发
+// 请求。此时 Host 和 Origin 都是攻击者的域名、二者自洽，只比较同源的检查会全部
+// 放行。浏览器按实际目标填 Host，页面脚本改不了它，所以 Host 白名单才是可靠判据。
+
+test('#31 DNS rebinding 形态的同源请求被拒绝', () => withHarness(async (harness) => {
+  const response = await harness.callHttp('/prompt-manager/api', {
+    headers: { host: 'evil.example', origin: 'http://evil.example' },
+  })
+  assert.equal(response.status, 403, 'Host 不是回环地址时必须拒绝')
+  assert.match(String(response.body?.error ?? ''), /host not allowed/)
+}))
+
+test('#32 Host 缺失或非回环一律拒绝', () => withHarness(async (harness) => {
+  const missing = await harness.callHttp('/prompt-manager/api', { headers: { host: '' } })
+  assert.equal(missing.status, 403, '缺少 Host 必须拒绝')
+
+  for (const host of ['192.168.1.10:49982', 'app.internal:49982', '0.0.0.0:49982']) {
+    const response = await harness.callHttp('/prompt-manager/api', { headers: { host } })
+    assert.equal(response.status, 403, `${host} 不在白名单里，必须拒绝`)
+  }
+}))
+
+test('#33 回环地址的各种写法都放行', () => withHarness(async (harness) => {
+  for (const host of ['127.0.0.1:62654', 'localhost:62654', '[::1]:62654', '127.0.0.1']) {
+    const response = await harness.callHttp('/prompt-manager/api', { headers: { host } })
+    assert.equal(response.status, 200, `${host} 应当放行`)
+  }
+}))

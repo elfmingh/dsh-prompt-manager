@@ -2001,6 +2001,28 @@ function workspaceEntries(document = state.document) {
   const MAX_BODY_BYTES = 1024 * 1024
 
   /**
+   * 允许访问这条路由的 Host 名。
+   *
+   * 只认回环地址。这不是「本机进程」的限制（它们能直接读 store 文件），而是为了
+   * 挡住 DNS rebinding：攻击者把自己的域名解析到 127.0.0.1，让用户浏览器朝本机
+   * 端口发请求。此时 Host 和 Origin **都是攻击者的域名**，两者相等 —— 只比较这两者
+   * 的同源检查会全部放行。浏览器按实际目标填 Host，脚本改不了，所以校验 Host
+   * 是不是回环才是可靠的判据。
+   *
+   * 如果宿主把界面暴露在局域网地址上（或走反向代理），把那个主机名加到
+   * `allowedHosts` 里，写法见 README。
+   */
+  const DEFAULT_ALLOWED_HOSTS = ['localhost', '127.0.0.1', '[::1]']
+  const allowedHosts = new Set(
+    (Array.isArray(config?.allowedHosts) ? config.allowedHosts : DEFAULT_ALLOWED_HOSTS)
+      .map((name) => String(name).trim().toLowerCase())
+      .filter(Boolean),
+  )
+
+  /** 去掉 `:port` 后缀（IPv6 的 `[::1]:8080` 也适用，因为方括号在端口之前就已闭合）。 */
+  const hostNameOf = (value) => String(value ?? '').trim().toLowerCase().replace(/:\d+$/, '')
+
+  /**
    * 路由守卫。
    *
    * 这条路由直接挂在宿主的 webServer 上，宿主不提供统一的认证或来源策略，
@@ -2008,14 +2030,25 @@ function workspaceEntries(document = state.document) {
    * 用「简单请求」（text/plain 表单）向本机端口发 POST —— 这类请求不触发预检，
    * 也就绕过了 CORS。因此：
    *
-   *   1. 带 Origin 且与 Host 不同源的一律拒绝（正常前端是同源页面）；
-   *   2. POST 必须是 application/json —— 简单请求发不出这个类型，浏览器会先
-   *      预检，而本路由不返回任何 CORS 响应头，预检必然失败；
-   *   3. 限制请求体大小。
+   *   1. Host 必须是回环地址 —— 挡 DNS rebinding（见上面 allowedHosts 的说明）。
+   *      校验放在最前面：它是唯一不被攻击者控制的量。
+   *   2. 带 Origin 且与 Host 不同源的一律拒绝（正常前端是同源页面）。
+   *   3. POST 必须是 application/json —— 简单请求发不出这个类型，浏览器会先
+   *      预检，而本路由不返回任何 CORS 响应头，预检必然失败。
+   *   4. 限制请求体大小。
    *
-   * 本机任意进程挡不住（它本来就能直接读 store 文件），这里防的是跨站。
+   * 本机任意进程挡不住（它本来就能直接读 store 文件），这里防的是浏览器。
    */
   function guardRequest(request) {
+    const hostHeader = String(request.headers?.host ?? '').trim().toLowerCase()
+    if (!hostHeader) {
+      // HTTP/1.1 要求带 Host。缺了它就没法判断请求打给谁，一律拒绝。
+      return { status: 403, error: 'missing host header' }
+    }
+    if (!allowedHosts.has(hostNameOf(hostHeader))) {
+      return { status: 403, error: 'host not allowed' }
+    }
+
     const origin = request.headers?.origin
     if (typeof origin === 'string' && origin) {
       let originHost = ''
