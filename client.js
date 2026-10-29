@@ -270,6 +270,8 @@ window.__ModuleLoader__.load({
       "contexts（工作目录、沙箱策略、插件注入的运行时信息等）每个会话都不同，改写规则也按会话隔离，已移到各会话的「提示词」页查看与改写。": "Contexts (working directory, sandbox policy, plugin-injected runtime info) differ per session and their rewrite rules are isolated per session; they moved to each session's \"Prompt\" page.",
       "sections {sections} 段 · {chars} 字": "sections {sections} · {chars} chars",
       "tools（只读）": "tools (read-only)",
+      "展开全文": "Show full text",
+      "收起": "Collapse",
     }
 
     function t(text, params) {
@@ -546,6 +548,32 @@ window.__ModuleLoader__.load({
     }
 
     // ----------------------------------------------------------- components
+
+    /**
+     * 长正文 + 展开控件。
+     *
+     * 截断只发生在显示层：数据、提交、diff 用的都是原文，所以展开看到的就是真正
+     * 存着的内容，不会因为「展开」而多出或少掉字符。
+     *
+     * 展开状态是组件内部的，切语言、重渲染、拖动都不会丢。展开后不设高度上限 ——
+     * 套一个可滚动的容器就变成「换个地方截断」了，用户会以为内容只有这么多。
+     */
+    function ClampedText(props) {
+      const [open, setOpen] = React.useState(false)
+      const text = String(props.text ?? '')
+      const limit = props.limit
+      const truncated = text.length > limit
+      return h('div', { style: { display: 'flex', flexDirection: 'column', gap: '5px', minWidth: 0 } },
+        h('p', { style: props.style }, open || !truncated ? text : `${text.slice(0, limit)}…`),
+        truncated
+          ? h('button', {
+            type: 'button',
+            style: { ...S.buttonTiny, alignSelf: 'flex-start' },
+            'aria-expanded': open,
+            onClick: () => setOpen((value) => !value),
+          }, open ? t('收起') : t('展开全文'))
+          : null)
+    }
 
     // 作用范围：三个值都给标签，列表上一眼能看出条目投给谁（选「继承」时也有标签，
     // 否则等于看不出来）。解释走 title tooltip，不占版面。
@@ -915,7 +943,7 @@ window.__ModuleLoader__.load({
                     disabled: busyId === entry.id,
                     onClick: () => remove(entry),
                   }, t('删除'))),
-                h('p', { style: S.text }, entry.text.length > 160 ? `${entry.text.slice(0, 160)}…` : entry.text))
+                h(ClampedText, { text: entry.text, limit: 160, style: S.text }))
             })),
 
         editing
@@ -1285,7 +1313,7 @@ window.__ModuleLoader__.load({
                         disabled: busy === item.id,
                         onClick: () => run(item.id, { action: 'override.forget', id: item.id }),
                       }, t('删除'))),
-                    h('p', { style: S.text }, text.length > 160 ? `${text.slice(0, 160)}…` : text))
+                    h(ClampedText, { text, limit: 160, style: S.text }))
                 })))
               : null,
 
@@ -1544,7 +1572,7 @@ window.__ModuleLoader__.load({
             }, t('保存覆盖')),
             h('button', { type: 'button', style: S.button, onClick: () => setEditing('') }, t('取消'))))
         : disabled
-          ? h('p', { style: { ...S.text, ...S.strike } }, text.length > 240 ? `${text.slice(0, 240)}…` : text)
+          ? h(ClampedText, { text, limit: 240, style: { ...S.text, ...S.strike } })
           : replaced
             ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: '4px', marginTop: '2px' } },
               h('div', { style: S.diffBar },
@@ -1559,7 +1587,7 @@ window.__ModuleLoader__.load({
                   overflow: 'hidden',
                 },
               }, renderDiffView(text, applied)))
-            : h('p', { style: S.text }, text.length > 240 ? `${text.slice(0, 240)}…` : text)
+            : h(ClampedText, { text, limit: 240, style: S.text })
       return h('div', { key: `${item.name}-${index}`, style: disabled ? S.itemOff : S.item }, head, body)
     }
 
