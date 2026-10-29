@@ -16,7 +16,7 @@
  * 存储：$DSH_HOME/prompt-manager.json（v1 文档在加载时自动迁移并回写）
  * 管理：模型工具 `prompt_manager` + Web UI + HTTP 路由 /prompt-manager/api
  */
-import { readFile, writeFile, rename, unlink } from 'node:fs/promises'
+import { readFile, writeFile, rename, unlink, readdir } from 'node:fs/promises'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { watch, appendFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -1487,8 +1487,32 @@ function workspaceEntries(document = state.document) {
 
   // ------------------------------------------------------------------- tool
 
+  /**
+   * host 侧的界面文案。
+   *
+   * client.js 那边有一张中文→英文的翻译表，但它管不到 host 拼出来的字符串 ——
+   * 摘要、操作结果、错误消息都是在这里生成的，最终都会显示在面板上。所以 host
+   * 也要跟着 DSH 的界面语言走。
+   *
+   * 写法是 hT(中文, English)：两段并排，改的时候一眼能看出对应关系，不会像
+   * 分离的两张表那样漏一半。
+   */
+  const hT = (zh, en) => (cachedLocale === 'en' ? en : zh)
+
   function summary() {
     const document = state.document
+    if (cachedLocale === 'en') {
+      const entries = document.entries.length
+      const enabled = document.applications.global.enabled.length
+      const spaces = Object.keys(document.applications.workspaces).length
+      const temporary = document.temporary.length
+      return (
+        `${entries} ${entries === 1 ? 'entry' : 'entries'}, ` +
+        `${enabled} enabled globally, ` +
+        `${spaces} ${spaces === 1 ? 'workspace' : 'workspaces'} with config, ` +
+        `${temporary} temporary`
+      )
+    }
     return `${document.entries.length} 个档案条目，全局启用 ${document.applications.global.enabled.length} 个，` +
       `${Object.keys(document.applications.workspaces).length} 个工作区有应用配置，${document.temporary.length} 条临时条目`
   }
@@ -1582,7 +1606,7 @@ function workspaceEntries(document = state.document) {
         const { ok } = await loadStoreInner()
         if (ok) adoptLegacyAgents()
         refreshRunningAgents()
-        return `已重新载入：${summary()}`
+        return hT(`已重新载入：${summary()}`, `Reloaded: ${summary()}`)
       }
       if (action === 'list') {
         const document = state.document
@@ -1615,10 +1639,10 @@ function workspaceEntries(document = state.document) {
       if (action === 'library.add' || action === 'library.update') {
         const document = state.document
         const id = typeof args?.id === 'string' ? args.id.trim() : ''
-        if (!id) return 'error: id 不能为空'
+        if (!id) return hT('error: id 不能为空', 'error: id is required')
         const existing = document.entries.find((entry) => entry.id === id)
-        if (action === 'library.add' && existing) return `error: 档案已存在 ${id}`
-        if (action === 'library.update' && !existing) return `error: 档案不存在 ${id}`
+        if (action === 'library.add' && existing) return hT(`error: 档案已存在 ${id}`, `error: entry already exists: ${id}`)
+        if (action === 'library.update' && !existing) return hT(`error: 档案不存在 ${id}`, `error: entry not found: ${id}`)
         const normalized = normalizeEntry({
           id,
           title: args?.title ?? existing?.title ?? id,
@@ -1626,17 +1650,19 @@ function workspaceEntries(document = state.document) {
           order: args?.order ?? existing?.order ?? DEFAULT_ORDER,
           agentScope: args?.agentScope ?? existing?.agentScope ?? 'inherit',
         })
-        if (!normalized) return 'error: text 不能为空'
+        if (!normalized) return hT('error: text 不能为空', 'error: text is required')
         const entries = document.entries.filter((entry) => entry.id !== id)
         entries.push(normalized)
         await saveStore({ ...document, entries })
         refreshRunningAgents()
-        return `${action === 'library.add' ? '已创建' : '已更新'}档案 ${id}`
+        return action === 'library.add'
+          ? hT(`已创建档案 ${id}`, `Created entry ${id}`)
+          : hT(`已更新档案 ${id}`, `Updated entry ${id}`)
       }
       if (action === 'library.remove') {
         const document = state.document
         const id = typeof args?.id === 'string' ? args.id.trim() : ''
-        if (!id || !document.entries.some((entry) => entry.id === id)) return `error: 档案不存在 ${id}`
+        if (!id || !document.entries.some((entry) => entry.id === id)) return hT(`error: 档案不存在 ${id}`, `error: entry not found: ${id}`)
         const applications = {
           global: { enabled: document.applications.global.enabled.filter((value) => value !== id) },
           workspaces: {},
@@ -1660,12 +1686,12 @@ function workspaceEntries(document = state.document) {
           applications,
         })
         refreshRunningAgents()
-        return `已删除档案 ${id}（并清理其全部应用关系）`
+        return hT(`已删除档案 ${id}（并清理其全部应用关系）`, `Deleted entry ${id} (and cleaned up all its applications)`)
       }
       if (action === 'apply.toggle') {
         const document = state.document
         const id = typeof args?.id === 'string' ? args.id.trim() : ''
-        if (!id || !document.entries.some((entry) => entry.id === id)) return `error: 档案不存在 ${id}`
+        if (!id || !document.entries.some((entry) => entry.id === id)) return hT(`error: 档案不存在 ${id}`, `error: entry not found: ${id}`)
         const enabled = args?.enabled !== false
         if ((args?.scope ?? 'global') !== 'workspace') {
           const list = document.applications.global.enabled.filter((value) => value !== id)
@@ -1675,10 +1701,12 @@ function workspaceEntries(document = state.document) {
             applications: { ...document.applications, global: { enabled: list } },
           })
           refreshRunningAgents()
-          return `全局${enabled ? '启用' : '禁用'} ${id}`
+          return enabled
+          ? hT(`全局启用 ${id}`, `Enabled ${id} globally`)
+          : hT(`全局禁用 ${id}`, `Disabled ${id} globally`)
         }
         const key = normalizePathValue(args?.workspacePath)
-        if (!key) return 'error: scope=workspace 需要 workspacePath'
+        if (!key) return hT('error: scope=workspace 需要 workspacePath', 'error: scope=workspace requires workspacePath')
         const workspaces = { ...document.applications.workspaces }
         const target = cloneWorkspace(workspaces[key])
         target.enabled = target.enabled.filter((value) => value !== id)
@@ -1689,14 +1717,16 @@ function workspaceEntries(document = state.document) {
         workspaces[key] = target
         await saveStore({ ...document, applications: { ...document.applications, workspaces } })
         refreshRunningAgents()
-        return `工作区 ${key} ${enabled ? '启用' : '禁用'} ${id}`
+        return enabled
+          ? hT(`工作区 ${key} 启用 ${id}`, `Enabled ${id} in workspace ${key}`)
+          : hT(`工作区 ${key} 禁用 ${id}`, `Disabled ${id} in workspace ${key}`)
       }
       if (action === 'apply.default') {
         const document = state.document
         const id = typeof args?.id === 'string' ? args.id.trim() : ''
         const key = normalizePathValue(args?.workspacePath)
-        if (!id || !document.entries.some((entry) => entry.id === id)) return `error: 档案不存在 ${id}`
-        if (!key) return 'error: apply.default 需要 workspacePath'
+        if (!id || !document.entries.some((entry) => entry.id === id)) return hT(`error: 档案不存在 ${id}`, `error: entry not found: ${id}`)
+        if (!key) return hT('error: apply.default 需要 workspacePath', 'error: apply.default requires workspacePath')
         const workspaces = { ...document.applications.workspaces }
         const target = cloneWorkspace(workspaces[key])
         if (args?.isDefault === false) {
@@ -1709,32 +1739,36 @@ function workspaceEntries(document = state.document) {
         workspaces[key] = target
         await saveStore({ ...document, applications: { ...document.applications, workspaces } })
         refreshRunningAgents()
-        return `${key} 的默认条目${args?.isDefault === false ? '取消' : '设为'} ${id}`
+        return args?.isDefault === false
+        ? hT(`取消 ${key} 的默认条目 ${id}`, `Cleared default entry ${id} for ${key}`)
+        : hT(`设为 ${key} 的默认条目 ${id}`, `Set ${id} as default for ${key}`)
       }
       // action 在上面统一转成小写，这里必须用全小写的规范形式比较，
       // 否则分支永远匹配不上（历史 bug：写的是 apply.hotReload）。
       if (action === 'apply.hotreload') {
         const document = state.document
         const key = normalizePathValue(args?.workspacePath)
-        if (!key) return 'error: apply.hotReload 需要 workspacePath'
+        if (!key) return hT('error: apply.hotReload 需要 workspacePath', 'error: apply.hotReload requires workspacePath')
         const workspaces = { ...document.applications.workspaces }
         const target = cloneWorkspace(workspaces[key])
         target.hotReload = args?.enabled !== false
         workspaces[key] = target
         await saveStore({ ...document, applications: { ...document.applications, workspaces } })
         refreshRunningAgents()
-        return `${key} 后注入${target.hotReload ? '已开启' : '已关闭'}`
+        return target.hotReload
+        ? hT(`${key} 后注入已开启`, `Post-injection enabled for ${key}`)
+        : hT(`${key} 后注入已关闭`, `Post-injection disabled for ${key}`)
       }
       if (action === 'override.set') {
         const document = state.document
         const name = typeof args?.name === 'string' ? args.name.trim() : ''
-        if (!name) return 'error: override.set 需要 name'
+        if (!name) return hT('error: override.set 需要 name', 'error: override.set requires name')
         const layer = args?.layer === 'context' ? 'contexts' : 'sections'
         const mode = args?.mode === 'disable' ? 'disable'
           : args?.mode === 'replace' ? 'replace'
             : args?.mode === 'enable' ? 'enable'
               : ''
-        if (!mode) return 'error: mode 必须是 disable / replace / enable'
+        if (!mode) return hT('error: mode 必须是 disable / replace / enable', 'error: mode must be disable / replace / enable')
         const current = document.overrides ?? {
           enabled: false,
           sections: {},
@@ -1747,7 +1781,7 @@ function workspaceEntries(document = state.document) {
         let rule = { mode }
         if (mode === 'replace') {
           const text = typeof args?.text === 'string' ? args.text : ''
-          if (!text.trim()) return 'error: replace 模式需要非空 text'
+          if (!text.trim()) return hT('error: replace 模式需要非空 text', 'error: replace mode requires non-empty text')
           rule = { mode, text }
         }
         const verb = mode === 'disable' ? '禁用' : mode === 'enable' ? '恢复原文' : '覆盖'
@@ -1763,7 +1797,10 @@ function workspaceEntries(document = state.document) {
           bucket[targetSession] = sessionRules
           await saveStore({ ...document, overrides: { ...current, enabled: true, [bucketKey]: bucket } })
           refreshRunningAgents()
-          return `${label} ${name} 已${verb}（仅会话 ${targetSession}，立即生效）`
+          return hT(
+        `${label} ${name} 已${verb}（仅会话 ${targetSession}，立即生效）`,
+        `${label} ${name} ${verb === 'disable' ? 'disabled' : verb === 'replace' ? 'overridden' : 'updated'} (session ${targetSession} only, effective immediately)`,
+      )
         }
 
         const rules = { ...(current[layer] ?? {}) }
@@ -1774,12 +1811,15 @@ function workspaceEntries(document = state.document) {
           overrides: { ...current, enabled: true, [layer]: rules },
         })
         refreshRunningAgents()
-        return `${label} ${name} 已${verb}（全局，新建会话生效；运行中的会话可在会话页单独调整）`
+        return hT(
+        `${label} ${name} 已${verb}（全局，新建会话生效；运行中的会话可在会话页单独调整）`,
+        `${label} ${name} ${verb === 'disable' ? 'disabled' : verb === 'replace' ? 'overridden' : 'updated'} (global, applies to new sessions; running ones can be adjusted on the session page)`,
+      )
       }
       if (action === 'override.clear') {
         const document = state.document
         const name = typeof args?.name === 'string' ? args.name.trim() : ''
-        if (!name) return 'error: override.clear 需要 name'
+        if (!name) return hT('error: override.clear 需要 name', 'error: override.clear requires name')
         const layer = args?.layer === 'context' ? 'contexts' : 'sections'
         const current = document.overrides ?? {
           enabled: false,
@@ -1796,7 +1836,10 @@ function workspaceEntries(document = state.document) {
           const bucketKey = layer === 'contexts' ? 'sessionContexts' : 'sessionSections'
           const bucket = { ...(current[bucketKey] ?? {}) }
           const sessionRules = { ...(bucket[targetSession] ?? {}) }
-          if (!sessionRules[name]) return `error: 会话 ${targetSession} 没有条目 ${name} 的改写记录`
+          if (!sessionRules[name]) return hT(
+          `error: 会话 ${targetSession} 没有条目 ${name} 的改写记录`,
+          `error: no rewrite rule for ${name} in session ${targetSession}`,
+        )
           const rule = sessionRules[name]
           delete sessionRules[name]
           if (Object.keys(sessionRules).length) bucket[targetSession] = sessionRules
@@ -1804,18 +1847,24 @@ function workspaceEntries(document = state.document) {
           const saved = appendSaved(current, layer, name, rule, targetSession)
           await saveStore({ ...document, overrides: { ...current, [bucketKey]: bucket, saved } })
           refreshRunningAgents()
-          return `${label} ${name} 已在会话 ${targetSession} 恢复默认`
+          return hT(
+        `${label} ${name} 已在会话 ${targetSession} 恢复默认`,
+        `${label} ${name} restored to default in session ${targetSession}`,
+      )
         }
 
         const rules = { ...(current[layer] ?? {}) }
-        if (!rules[name]) return `error: 没有条目 ${name} 的改写记录`
+        if (!rules[name]) return hT(`error: 没有条目 ${name} 的改写记录`, `error: no rewrite rule for ${name}`)
         const rule = rules[name]
         delete rules[name]
         // 恢复默认时把覆盖文本归档，之后还能再应用回来。
         const saved = appendSaved(current, layer, name, rule)
         await saveStore({ ...document, overrides: { ...current, [layer]: rules, saved } })
         refreshRunningAgents()
-        return `${label} ${name} 已恢复默认（全局，新建会话生效）`
+        return hT(
+        `${label} ${name} 已恢复默认（全局，新建会话生效）`,
+        `${label} ${name} restored to default (global, applies to new sessions)`,
+      )
       }
       if (action === 'override.toggle') {
         const document = state.document
@@ -1823,7 +1872,9 @@ function workspaceEntries(document = state.document) {
         const current = document.overrides ?? { enabled: false, sections: {}, contexts: {}, saved: [] }
         await saveStore({ ...document, overrides: { ...current, enabled } })
         refreshRunningAgents()
-        return `内置提示词改写总开关${enabled ? '已开启' : '已关闭'}`
+        return enabled
+        ? hT('内置提示词改写总开关已开启', 'Builtin prompt rewriting enabled')
+        : hT('内置提示词改写总开关已关闭', 'Builtin prompt rewriting disabled')
       }
       if (action === 'override.reset') {
         const document = state.document
@@ -1853,7 +1904,10 @@ function workspaceEntries(document = state.document) {
           }
           await saveStore({ ...document, overrides: { ...next, saved: saved.slice(0, 100) } })
           refreshRunningAgents()
-          return `已恢复会话 ${targetSession} 的 ${count} 条规则（立即生效，覆盖文本已归档）`
+          return hT(
+        `已恢复会话 ${targetSession} 的 ${count} 条规则（立即生效，覆盖文本已归档）`,
+        `Restored ${count} rules for session ${targetSession} (effective immediately, override text archived)`,
+      )
         }
 
         let saved = [...(current.saved ?? [])]
@@ -1890,12 +1944,15 @@ function workspaceEntries(document = state.document) {
         // 保存成功后再清基线 —— 顺序反过来就会在写盘失败时提前改变运行中的提示词。
         sessionBaselines.clear()
         refreshRunningAgents()
-        return `已恢复全部内置提示词，清除 ${count} 项规则（覆盖文本已归档 ${saved.length} 条）`
+        return hT(
+        `已恢复全部内置提示词，清除 ${count} 项规则（覆盖文本已归档 ${saved.length} 条）`,
+        `Restored all builtin prompts, cleared ${count} rules (${saved.length} override texts archived)`,
+      )
       }
       if (action === 'override.restore') {
         const document = state.document
         const id = typeof args?.id === 'string' ? args.id.trim() : ''
-        if (!id) return 'error: override.restore 需要 id'
+        if (!id) return hT('error: override.restore 需要 id', 'error: override.restore requires id')
         const current = document.overrides ?? {
           enabled: false,
           sections: {},
@@ -1905,7 +1962,7 @@ function workspaceEntries(document = state.document) {
           saved: [],
         }
         const item = (current.saved ?? []).find((entry) => entry.id === id)
-        if (!item) return `error: 找不到已保存的覆盖 ${id}`
+        if (!item) return hT(`error: 找不到已保存的覆盖 ${id}`, `error: saved override not found: ${id}`)
 
         // 来自某会话的覆盖，装回那个会话，不污染全局。
         if (item.sessionId) {
@@ -1916,29 +1973,32 @@ function workspaceEntries(document = state.document) {
           bucket[item.sessionId] = sessionRules
           await saveStore({ ...document, overrides: { ...current, enabled: true, [bucketKey]: bucket } })
           refreshRunningAgents()
-          return `已应用保存的覆盖：${item.name}（仅会话 ${item.sessionId}，立即生效）`
+          return hT(
+        `已应用保存的覆盖：${item.name}（仅会话 ${item.sessionId}，立即生效）`,
+        `Applied saved override: ${item.name} (session ${item.sessionId} only, effective immediately)`,
+      )
         }
 
         const rules = { ...(current[item.layer] ?? {}) }
         rules[item.name] = { mode: 'replace', text: item.text }
         await saveStore({ ...document, overrides: { ...current, enabled: true, [item.layer]: rules } })
         refreshRunningAgents()
-        return `已应用保存的覆盖：${item.name}`
+        return hT(`已应用保存的覆盖：${item.name}`, `Applied saved override: ${item.name}`)
       }
       if (action === 'override.forget') {
         const document = state.document
         const id = typeof args?.id === 'string' ? args.id.trim() : ''
-        if (!id) return 'error: override.forget 需要 id'
+        if (!id) return hT('error: override.forget 需要 id', 'error: override.forget requires id')
         const current = document.overrides ?? { enabled: false, sections: {}, contexts: {}, saved: [] }
         const saved = (current.saved ?? []).filter((entry) => entry.id !== id)
-        if (saved.length === (current.saved ?? []).length) return `error: 找不到已保存的覆盖 ${id}`
+        if (saved.length === (current.saved ?? []).length) return hT(`error: 找不到已保存的覆盖 ${id}`, `error: saved override not found: ${id}`)
         await saveStore({ ...document, overrides: { ...current, saved } })
-        return `已删除保存的覆盖 ${id}`
+        return hT(`已删除保存的覆盖 ${id}`, `Deleted saved override ${id}`)
       }
       if (action === 'temp.add') {
         const document = state.document
         const text = typeof args?.text === 'string' ? args.text : ''
-        if (!text.trim()) return 'error: text 不能为空'
+        if (!text.trim()) return hT('error: text 不能为空', 'error: text is required')
         const temporary = normalizeTemporary({
           id: typeof args?.id === 'string' && args.id.trim() ? args.id.trim() : `temp-${Date.now().toString(36)}`,
           sessionId: args?.sessionId,
@@ -1947,23 +2007,26 @@ function workspaceEntries(document = state.document) {
           order: args?.order,
           agentScope: args?.agentScope,
         })
-        if (!temporary) return 'error: 临时条目无效'
+        if (!temporary) return hT('error: 临时条目无效', 'error: invalid temporary entry')
         const rest = document.temporary.filter((item) => item.id !== temporary.id)
         await saveStore({ ...document, temporary: [...rest, temporary] })
         refreshRunningAgents()
-        return `已添加临时条目 ${temporary.id}（session=${temporary.sessionId || '任意'}）`
+        return hT(
+        `已添加临时条目 ${temporary.id}（session=${temporary.sessionId || '任意'}）`,
+        `Added temporary entry ${temporary.id} (session=${temporary.sessionId || 'any'})`,
+      )
       }
       if (action === 'temp.remove') {
         const document = state.document
         const id = typeof args?.id === 'string' ? args.id.trim() : ''
-        if (!id) return 'error: id 不能为空'
+        if (!id) return hT('error: id 不能为空', 'error: id is required')
         const rest = document.temporary.filter((item) => item.id !== id)
-        if (rest.length === document.temporary.length) return `error: 临时条目不存在 ${id}`
+        if (rest.length === document.temporary.length) return hT(`error: 临时条目不存在 ${id}`, `error: temporary entry not found: ${id}`)
         await saveStore({ ...document, temporary: rest })
         refreshRunningAgents()
-        return `已删除临时条目 ${id}`
+        return hT(`已删除临时条目 ${id}`, `Deleted temporary entry ${id}`)
       }
-      return `error: 未知 action ${action}`
+      return hT(`error: 未知 action ${action}`, `error: unknown action ${action}`)
   }
 
   // ------------------------------------------------------------- http route
@@ -1980,6 +2043,78 @@ function workspaceEntries(document = state.document) {
     } catch {
       return []
     }
+  }
+
+  /**
+   * 界面语言。
+   *
+   * DSH 自己把语言放在 `@deepseek-ai/dsh-client-locale` 的 `config.preference` 里，
+   * 写在 profile 的 `cordis.patch.yml`。那是 **client 侧**插件，host 拿不到它的服务
+   * 对象 —— 但配置文件本身可读，而 `DSH_PROFILE_DIR` 环境变量直接给出了目录。
+   *
+   * 不能退而求其次用 `navigator.language`：那是**浏览器/系统**语言，和 DSH 的界面
+   * 语言是两件事。系统中文 + DSH 设英文时，浏览器语言仍是 zh，插件就会一直显示中文，
+   * 跟界面上其它部分对不上。
+   *
+   * 只读一次并缓存：改语言本来就要重启 DSH 才生效，缓存与它同生命周期。
+   */
+  let cachedLocale = null
+
+  async function resolveLocale(preferred) {
+    // 请求里带的语言优先级最高：它反映用户此刻在界面上选的，比配置文件实时。
+    // 用户在设置里切换语言时不会改写 cordis.patch.yml，只看配置就会一直用旧语言。
+    const fromRequest = String(preferred ?? '').trim().toLowerCase()
+    if (fromRequest) {
+      cachedLocale = fromRequest.startsWith('zh') ? 'zh' : 'en'
+      return cachedLocale
+    }
+
+    if (cachedLocale !== null) return cachedLocale
+    cachedLocale = ''
+
+    const home = process.env.DSH_HOME || join(homedir(), '.dsh')
+    const candidates = []
+
+    // 1) DSH 直接给的 profile 目录。注意：这个变量在**子进程**（bash 工具）里一定有，
+    //    但主进程自己未必有 —— 不能假设它在。
+    if (process.env.DSH_PROFILE_DIR) {
+      candidates.push(join(process.env.DSH_PROFILE_DIR, 'cordis.patch.yml'))
+    }
+    // 2) 用 DSH_HOME + DSH_PROFILE 自己拼。
+    if (process.env.DSH_PROFILE) {
+      candidates.push(join(home, 'profiles', process.env.DSH_PROFILE, 'cordis.patch.yml'))
+    }
+    // 3) 兜底：把所有 profile 的 patch 都试一遍。哪个 profile 是"当前活动"的不重要 ——
+    //    用户只可能在一处设语言，找到带 locale 配置的那个就是它。
+    try {
+      for (const name of await readdir(join(home, 'profiles'))) {
+        candidates.push(join(home, 'profiles', name, 'cordis.patch.yml'))
+      }
+    } catch {
+      /* 没有 profiles 目录就跳过 */
+    }
+
+    for (const file of candidates) {
+      try {
+        const text = await io.readFile(file, 'utf8')
+        // 形如：
+        //   - id: locale
+        //     name: "@deepseek-ai/dsh-client-locale"
+        //     config:
+        //       preference: en
+        const matched = text.match(/- id:\s*locale\b[\s\S]{0,600}?preference:\s*['"]?([A-Za-z_-]+)/)
+        if (matched) {
+          cachedLocale = matched[1].toLowerCase()
+          diag(`locale-resolved ${cachedLocale} file=${file}`)
+          return cachedLocale
+        }
+      } catch {
+        /* 这个候选读不到，试下一个 */
+      }
+    }
+
+    diag(`locale-unresolved tried=${candidates.length}`)
+    return cachedLocale
   }
 
   function snapshot() {
@@ -2126,7 +2261,9 @@ function workspaceEntries(document = state.document) {
                 send(200, {
                   ok: false,
                   sessionId: key,
-                  reason: '本进程内还没有该会话的装配记录：等目标会话产生一轮回复后再刷新。',
+                  reason: cachedLocale === 'en'
+                    ? 'No assembly recorded for that session yet — wait for it to produce one reply, then refresh.'
+                    : '本进程内还没有该会话的装配记录：等目标会话产生一轮回复后再刷新。',
                   subagent: sessionFacts.get(key)?.subagent === true,
                   overrides,
                   sectionRules: effectiveSectionRules,
@@ -2265,7 +2402,11 @@ function workspaceEntries(document = state.document) {
               })
               return
             }
-            send(200, snapshot())
+            // 必须先解析语言再拼 snapshot：snapshot() 里的 summary() 依赖
+            // cachedLocale。顺序反过来的话，首次响应会固化一份「语言还没定」的
+            // 文案，而客户端往往只拉这一次 —— 用户看到的就是初始化时的旧语言。
+            const locale = await resolveLocale(url.searchParams.get('lang'))
+            send(200, { ...snapshot(), locale })
             return
           }
           if (request.method !== 'POST') {
@@ -2282,12 +2423,16 @@ function workspaceEntries(document = state.document) {
             }
           }
           const args = raw ? JSON.parse(raw) : {}
+          // 语言必须在 execute 之前定下来：返回的文案（已创建 / 各类错误）就是
+          // 按当前语言生成的，事后再解析来不及。
+          const postUrl = new URL(request.url || '/', 'http://127.0.0.1')
+          const locale = await resolveLocale(postUrl.searchParams.get('lang'))
           const result = await toolDefinition.execute(args)
           if (String(result).startsWith('error:')) {
             send(400, { ok: false, error: String(result).slice(6).trim() })
             return
           }
-          send(200, { ok: true, message: String(result), ...snapshot() })
+          send(200, { ok: true, message: String(result), locale, ...snapshot() })
         } catch (error) {
           diag(`http-handler-failed ${error?.stack ?? error}`)
           send(500, { ok: false, error: String(error?.message ?? error) })

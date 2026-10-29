@@ -145,7 +145,9 @@ test('HTTP：snapshot 端点返回文档与摘要', async (t) => {
   const response = await h.callHttp('/prompt-manager/api')
   assert.equal(response.status, 200)
   assert.equal(response.body.entries.length, 1)
-  assert.match(String(response.body.summary), /1 个档案条目/)
+  // summary 的语言跟随 DSH 的界面语言（host 读 profile 的 cordis.patch.yml），
+  // 而测试进程不一定读得到那份配置 —— 所以只断言结构，不锁死文案语言。
+  assert.match(String(response.body.summary), /1 (个档案条目|entry)/)
 })
 
 test('HTTP：assembled 无快照时返回 ok:false 与原因', async (t) => {

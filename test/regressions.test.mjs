@@ -44,7 +44,8 @@ test('#13 读失败不会隔离正常配置，也不会清空内存文档', () =
   await harness.callTool({ action: 'reload' })
 
   const listed = await harness.callTool({ action: 'list' })
-  assert.match(listed, /1 个档案条目/, `读失败后应保留最后一份有效文档，实际输出：${listed}`)
+  // 同上：summary 的语言跟随 DSH 设置，测试里不锁死具体语言。
+  assert.match(listed, /1 (个档案条目|entry)/, `读失败后应保留最后一份有效文档，实际输出：${listed}`)
 
   // 那次目录也不是「被解析坏的文件」，不该被 rename 走。
   rmSync(harness.storeFile, { recursive: true, force: true })

@@ -370,7 +370,7 @@ node scripts/find-in-asar.mjs "要搜的文本" [前后字符数]               
 
 ## ⚠️ 已知限制 · Known limitations
 
-- **界面目前只有中文。** README、CHANGELOG 和文档是中英对照的，面板文案不是：`client.js` 里的界面字符串是硬编码中文，`locale/*.json` 只提供插件列表里显示的标题与简介（中英各一份，跟随宿主语言）。英文界面尚未实现。
+- **界面语言跟随 DSH 的界面语言，并且在切换时立即生效。** 取值顺序是宿主 locale 服务（`ctx.locale.getLocale().active`）→ `<html lang>` → `navigator.language`。前两个都同步可读，第三条只是兜底 —— 用系统语言判断是错的，系统中文 + DSH 英文时会判成中文。侧边栏和会话页签的标题由宿主渲染，它本来就订阅了 `ctx.locale`、语言一变就重新调 `label()`，所以插件里的 `t()` 也必须现场读，不能缓存。另有少量文案来自 Host 侧（工具返回值、`prompt_manager` 的 action 结果），这些也跟随界面语言，通过请求上的 `?lang=` 传过去。
 - 静态注册的条目改不到已经在运行的 agent，只能靠重建会话
 - 后注入只能追加，要撤掉已注入的内容必须用 override disable
 - `required: true` 的 context 被移除后是否恢复，由框架决定
@@ -399,7 +399,7 @@ node scripts/find-in-asar.mjs "要搜的文本" [前后字符数]               
 
 **English:**
 
-- **The panel UI is Chinese only.** The README, CHANGELOG and docs are bilingual; the panel strings are not — they are hardcoded Chinese in `client.js`. `locale/*.json` only carries the title and summary shown in the plugin list (one file per language, following the host locale). An English UI is not implemented yet.
+- **The panel language follows DSH's UI language and switches live.** Resolution order is the host locale service (`ctx.locale.getLocale().active`), then `<html lang>`, then `navigator.language`. The first two are synchronously readable; the third is only a fallback — judging by system language is wrong, since a Chinese system with DSH set to English resolves to Chinese. The sidebar and conversation-tab titles are rendered by the host, which already subscribes to `ctx.locale` and re-invokes `label()` on every switch, so the plugin's `t()` must read live rather than cache. A few strings come from the host side (tool return values and `prompt_manager` action results); those follow the UI language too, carried on the request as `?lang=`.
 - Static entries cannot reach an agent that is already running; only rebuilding the session helps
 - Post-hoc injection can only append; removing injected content requires an override `disable`
 - Whether a `required: true` context comes back after removal is up to the framework
