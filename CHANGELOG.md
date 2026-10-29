@@ -1,6 +1,24 @@
 # Changelog
 
-## 0.4.0 — 2026-10-29
+## 0.4.1 — 2026-10-29
+
+只有版本号不同，代码与 0.4.0 完全一致。
+
+0.4.0 没能发布到 npm：发布流程在 `npm publish` 那一步失败，registry 上从未出现
+这个版本。失败的形态是 provenance 的 Sigstore 透明度日志（Rekor）冲突：
+
+1. publish 先把 tarball 的 provenance 写进 Rekor —— 成功；
+2. 随后的 registry 上传失败（真实原因被 npm 的内部重试覆盖掉了，日志里只剩最后一次的输出）；
+3. npm 重试整条 publish，同一个 tarball 的日志条目已经存在，返回
+   `409 TLOG_CREATE_ENTRY_ERROR: an equivalent entry already exists`。
+
+Rekor 条目按内容寻址且不可撤销，而 `npm pack` 会把 mtime 归一化成固定值 ——
+同样的文件永远产出同样的 shasum，所以**同一个 tarball 无法再带 provenance 发布**，
+重跑流水线只会重复撞同一个 409。换版本号让 tarball 内容发生变化，是最干净的出路。
+
+`v0.4.0` 这个 tag 仍指向未发布的 `f817beb`，保留作为这次失败尝试的记录。
+
+## 0.4.0 — 2026-10-29 · 未发布到 npm
 
 面板界面支持英文，并且跟随 DSH 的界面语言实时切换。数据格式仍是 v2，无 API 变更。
 
