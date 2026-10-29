@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "提示词管理器",
-    "description": "分三层管理提示词段落：全局（所有会话）、会话（指定 sessionId）、上下文（按 cwd / preset / sessionId 条件匹配）。数据保存在 $DSH_HOME/prompt-manager.json。"
+    "description": "分层管理提示词档案：全局（所有会话）、工作区（按目录匹配）、会话（指定 sessionId）。内置段落与运行时上下文可禁用或覆盖，改动带逐行 diff。数据保存在 $DSH_HOME/prompt-manager.json。"
   }
 }

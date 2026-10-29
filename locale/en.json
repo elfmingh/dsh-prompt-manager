@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Prompt Manager",
-    "description": "Manage prompt sections in three scopes: global (all sessions), session (one session id), and context (sessions matching cwd, preset, or session id). Stored in $DSH_HOME/prompt-manager.json."
+    "description": "Layered prompt profiles at three scopes: global (all sessions), workspace (by directory), and session (one session id). Built-in sections and runtime contexts can be disabled or overridden, with a line-level diff. Stored in $DSH_HOME/prompt-manager.json."
   }
 }
