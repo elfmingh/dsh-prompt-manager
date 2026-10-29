@@ -98,19 +98,19 @@ for "how do I pin an instruction to every session" looks under tools/presets, no
 
 ---
 
-## 待补：UI 截图
+## UI 截图（已备）
 
-CONTRIBUTING 写的是「include GIF/screenshot for UI」。这条是**硬性的质量要求**，
-但它是给人看的，不是 CI 检查。我们有两个面板（侧边栏档案列表、会话页签），
-建议至少一张侧边栏截图，能看清三级投放和 diff 更好。
+已放在仓库 `docs/screenshot-panel.png`（86 KB，2175×731，深色主题），README 顶部已引用。
 
-三条路，按推荐度排：
+因为它不在 `package.json` 的 `files` 里（图片不进 npm 包），README 用的是 **GitHub 绝对 URL** 而不是相对路径，这样 npm 页面上的图也能显示：
 
-1. **手动截一张**（最快）。打开 `http://127.0.0.1:58806`，展开侧边栏面板截图，
-   放进仓库 `docs/screenshot-panel.png`，README 里引用，PR 正文里贴 URL。
-2. 我写一个脚本用 Playwright/Puppeteer 截，但项目零依赖、不想为截图引入 devDependency，
-   得单独装。
-3. 先不贴图提交，看维护者是否 `request changes` 再补。风险是白跑一轮。
+```
+https://raw.githubusercontent.com/elfmingh/dsh-prompt-manager/main/docs/screenshot-panel.png
+```
+
+截图内容：左侧档案库（2 条）、右侧投放区（全局 chips + 工作区下拉 + 拖放区）、底部 store 路径。一张图同时说明了「三级投放」和「拖拽即应用」这两件事。
+
+PR 正文里贴这个 URL 即可。
 
 ## 其他五个目录
 

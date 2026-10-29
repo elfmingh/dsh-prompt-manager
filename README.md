@@ -11,6 +11,12 @@
 
 **A layered prompt manager for DeepSeek Harness** — reusable prompt entries delivered at three levels (global / workspace / session), with built-in sections and runtime contexts you can disable or replace, and a line-level diff for every change. No build step: edit, refresh, done.
 
+![侧边栏面板：左侧是档案库，右侧把条目拖进「全局」或某个工作区即可投放](https://raw.githubusercontent.com/elfmingh/dsh-prompt-manager/main/docs/screenshot-panel.png)
+
+左侧是档案库，右侧是投放区：把条目拖进「全局」就是所有会话都带上，拖进某个工作区就只在那个目录生效。图底部那行是存储文件的实际位置。
+
+**On the left is the library, on the right the drop zone.** Drag an entry into "global" and every session gets it; drag it into a workspace and only that directory does. The bottom line shows where the store file actually lives.
+
 它解决的是这几件事：
 
 - 想给所有会话固定加一段指令，但又不想动 DSH 源码或每次手动粘贴
