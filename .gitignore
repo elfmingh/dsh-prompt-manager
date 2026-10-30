@@ -10,6 +10,11 @@ research/
 # 真实提示词装配快照：包含当前环境的系统提示词与会话内容
 docs/snapshots/
 
+# 收录投稿材料：条目 yml、PR 正文、提交笔记
+# 只是本机准备产物，是给别人仓库提 PR 用的，不必进我们自己的公开仓库
+docs/awesome-dsh/
+docs/pr-awesome-dsh.md
+
 # 编辑器与系统
 .DS_Store
 Thumbs.db
