@@ -2,13 +2,17 @@
 
 准备好于 2026-10-30。对应版本 `@vertixara/dsh-prompt-manager@0.4.1`。
 
+> 这份文件取代了原来的 `submission/` 目录。之前那里有一份同样目的的材料，但和
+> 这份内容不一致（分类 `agi` vs `identity`、描述范围也不同），两份并存容易拿错。
+> 现在只有这一处。
+
 ## 目标仓库
 
 **[awesome-dsh-plugin/awesome-dsh-plugin](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin)**
 
-这份文件之前推荐的是 `awesome-deepseekharness/awesome-deepseek-harness`，那是错的：
-那个仓库要改两份 README 的表格行，PR 之间会互相冲突，而且要手工编 README。
-这个仓库把列表拆成了 `data/plugins/` 下的一千多个 YAML，一个插件一个文件 ——
+更早的版本推荐的是 `awesome-deepseekharness/awesome-deepseek-harness`，那是错的：
+那个仓库要手工改两份 README 的表格行，PR 之间会互相冲突，而且要手工编 README。
+这个仓库把列表拆成 `data/plugins/` 下一千多个 YAML，一个插件一个文件 ——
 **一个文件就是全部投稿**，README 在合并后由 `main` 自动重新生成。条目文件永不
 相撞，所以 PR 不会因为别人先合并而失效。规模也更大（3000+ 条目）。
 
@@ -27,15 +31,18 @@
 url: https://github.com/elfmingh/dsh-prompt-manager
 name: elfmingh/dsh-prompt-manager
 category: identity
+icon: https://raw.githubusercontent.com/elfmingh/dsh-prompt-manager/main/assets/icon.png
 description:
   en: ...
   zh: ...
 ```
 
-字段只有 `url` / `name` / `category` / `description.{en,zh}`。
 `description.en` 是唯一必填项，`zh` 可选（缺了维护者会补）。
 **不要**写 `npm:` —— 那个字段会被校验直接拒绝，npm 映射是从 registry 自动采集的，
 前提是包的 `repository` 字段指回本仓库（我们的已指向）。
+
+`icon:` 是 GitHub 托管的位图，512×512 PNG，**已经在 `main` 上**（`assets/icon.png`，
+提交 `9b0d745`），所以那个 raw URL 现在就有效。SVG 和第三方图床会被拒。
 
 分类选 `identity` 的理由：列表里做「提示词注入 / agent 指令」的插件都在这一类
 （`dsh-prompt-inject`、`dsh-agent-instructions`）。规范明说分类选得不够准由维护者
@@ -70,6 +77,9 @@ gh pr create \
   --body-file /path/to/dsh-prompt-manager/docs/awesome-dsh/pr-body.md
 ```
 
+**只加这一个文件**，不要动任何 README —— 它们由脚本从 `data/plugins/*.yml` 生成。
+本地重新生成预预览是可以的，但会被要求与数据源一致，不如不碰。
+
 ## 逐条核对
 
 | CI 检查 | 我们的状态 |
@@ -77,8 +87,8 @@ gh pr create \
 | 一个 PR 最多 3 条 | 1 条 |
 | `package.json` 声明 `dsh.bundle` | ✅ `{ "bundle": { "patch": "./cordis.patch.yml" } }`，`cordis.patch.yml` 在仓库根 |
 | 仓库创建满 1 天 | ✅ 2026-10-23，已 7 天 |
-| `awesome-lint` / 站点构建 | 字段用最小集，YAML 已用 `yaml` 包解析验证 |
-| `category` 在允许集内 | ✅ `identity` |
+| `awesome-lint` / 站点构建 | 字段用最小集，YAML 已用 `yaml` 包解析验证，`icon` 只接受 GitHub 托管位图 |
+| `category` 在允许集内 | ✅ `identity`（取值表见对方 `contributing.md`） |
 | `dsh-plugin` topic | ✅（另有 `cordis-plugin` `deepseek-harness` `prompt-management` `system-prompt`） |
 | 无重复条目 | ✅ 三页 `data/plugins/` 全查过，无 `elfmingh` |
 | 描述属实、无营销词 | 见下 |
@@ -96,17 +106,25 @@ gh pr create \
 | 禁用 / 覆盖内置段落与运行期 context | `override.set` / `override.clear`，`layer` 取 `section` 或 `context` |
 | 覆盖的逐行 diff | `client.js` 的 `diffBlocks` / `renderDiffView` |
 | 子代理作用域 | 条目 `agentScope`：`main` / `subagent` / `inherit` |
+| 装配快照（含子代理） | `index.js` 的 `assemblySnapshots` / `recordSnapshot`，由 `system-prompt/assemble` 钩子填充，`?view=assembled` 读回 |
 | Web 面板 + `prompt_manager` 工具 | `sidebar.panellist` / `conversation.view` 槽位；工具定义 |
 
-## 可选但没做
+**没有写工具数量。** 实际是 18 个动作，但一行描述里塞不下 18 个名字，而写了数字
+维护者就会去数 —— 不如不写。
 
-- **`icon:`** —— 需要 GitHub 托管的位图（png/jpg/webp），约 96px 方形最清楚，
-  SVG 会被拒。我们仓库的 `icon.svg` 用不了，`docs/screenshot-panel.png` 是 2175×731
-  的长条。不写则回退到作者头像，先空着。
-- **`screenshots.json`** —— 规范推荐放在我们仓库 `package.json` 旁边，1–8 张图。
-  不写也没关系，市场会从 README 自动抽取（我们 README 顶部就有截图）。
-  想要更好的展示效果再加，这不属于本 PR 的内容。
-- **`tarball:`** —— 只在自己不发 npm 时才需要，我们发了 0.4.1。
+## 可选：截图
+
+市场详情页会展示 App Store 式截图。想控制顺序和取舍，在我们仓库 `package.json`
+旁边放一个 `screenshots.json`：
+
+```json
+["docs/screenshot-panel.png"]
+```
+
+规则：1–8 张、相对路径不能跳出插件目录、也接受 GitHub 托管的绝对 URL。
+不写也行 —— 市场会从 README 自动抽取（我们 README 顶部就有截图）。
+
+**这不属于本 PR。** 推我们自己的仓库即可，下一次构建自动生效。
 
 ## 其他候选仓库（格式各不相同，别照抄这份）
 

@@ -11,7 +11,7 @@
 
 - 📦 Published to npm as `@vertixara/dsh-prompt-manager@0.4.1`; the package's `repository` field points back at this repo.
 - 🔗 Official `@deepseek-ai/*` packages are declared as `peerDependencies` (`@deepseek-ai/cordis`), not `dependencies`.
-- 🖼️ `docs/screenshot-panel.png` lives in the repo and is referenced from the README. No `screenshots.json` yet, so storefronts can extract from the README.
+- 🖼️ `assets/icon.png` (512×512) is the entry's `icon:` — already on `main`, so the raw URL resolves today. `docs/screenshot-panel.png` is referenced from the README. No `screenshots.json` yet, so storefronts can fall back to extracting from the README.
 
 ---
 
@@ -26,6 +26,7 @@ The entry makes four claims. Reviewing them against the source:
 | Individual builtin sections and runtime contexts can be disabled or overridden | `override.set` / `override.clear`, with `layer` set to `section` or `context` |
 | A line-level diff of what an override changed | `client.js`: `diffBlocks` and `renderDiffView`, computed against the original text |
 | A subagent scope per entry | `agentScope`, one of `main` / `subagent` / `inherit` |
+| Assembly snapshots record what each turn received, subagents included | `index.js`: `assemblySnapshots` and `recordSnapshot`, filled from the `system-prompt/assemble` hook and read back through `?view=assembled` |
 | Managed from a Web panel and a `prompt_manager` tool | seats on `sidebar.panellist` and `conversation.view`; the `prompt_manager` tool definition |
 
 ## Not a duplicate / 与既有条目的区别
