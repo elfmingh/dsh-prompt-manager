@@ -66,7 +66,8 @@ dsh plugin --profile web add @vertixara/dsh-prompt-manager
 本地源码（开发时）/ From source, while developing:
 
 ```powershell
-dsh plugin --profile web add link:D:\dsh-dev\plugins\dsh-prompt-manager
+git clone https://github.com/elfmingh/dsh-prompt-manager.git
+dsh plugin --profile web add link:./dsh-prompt-manager
 dsh web
 ```
 
