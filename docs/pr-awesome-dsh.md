@@ -1,118 +1,122 @@
-# 提交清单：awesome-dsh-plugin 收录
+# 收录提交：awesome-dsh-plugin
 
-准备于 2026-10-29。对应版本 `@vertixara/dsh-prompt-manager@0.3.1`。
+准备好于 2026-10-30。对应版本 `@vertixara/dsh-prompt-manager@0.4.1`。
 
-## 一个前提要先说清
+## 目标仓库
 
-搜索下来**没有唯一权威的 "awesome-dsh-plugin"**，至少有六个仓库在做同类目录：
+**[awesome-dsh-plugin/awesome-dsh-plugin](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin)**
 
-| 仓库 | 规模/特征 | 判断 |
-|---|---|---|
-| [awesome-deepseekharness/awesome-deepseek-harness](https://github.com/awesome-deepseekharness/awesome-deepseek-harness) | 有正式 CONTRIBUTING、双语 README、CI 检查双语一致性、24–48h 合并 | **主投这里** |
-| [kejixiaoliang/awesome-dsh-plugins](https://github.com/kejixiaoliang/awesome-dsh-plugins) | 号称 14 类 280+ 插件，最全 | 次选 |
-| [beancookie/awesome-dsh-plugin](https://github.com/beancookie/awesome-dsh-plugin) | — | 可选 |
-| [awesome-dsh-plugin/awesome-dsh-plugin](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin) | 组织账号 | 可选 |
-| [ysr666/awesome-dsh-plugin-1](https://github.com/ysr666/awesome-dsh-plugin-1) | — | 可选 |
-| [billliao/awesome-dsh-plugin](https://github.com/billliao/awesome-dsh-plugin) | — | 可选 |
+这份文件之前推荐的是 `awesome-deepseekharness/awesome-deepseek-harness`，那是错的：
+那个仓库要改两份 README 的表格行，PR 之间会互相冲突，而且要手工编 README。
+这个仓库把列表拆成了 `data/plugins/` 下的一千多个 YAML，一个插件一个文件 ——
+**一个文件就是全部投稿**，README 在合并后由 `main` 自动重新生成。条目文件永不
+相撞，所以 PR 不会因为别人先合并而失效。规模也更大（3000+ 条目）。
 
-之前几轮对话里我一直笼统说"awesome-dsh-plugin 的 PR 没提"，其实没有确认过是哪一个。
-下面是按最正规的那个（`awesome-deepseekharness`）准备的，其余可以照抄同一套行。
+## 要提交的东西
 
-## 前置条件核对
+只有两个文件在本目录，第一个是投稿内容，第二个是 PR 正文（`gh` 可以直接吃）：
 
-| 要求 | 我们的状态 |
+| 本地文件 | 提交到 |
 |---|---|
-| DSH 相关性（README 说明安装方式） | ✅ `dsh plugin --profile web add` |
-| 可安装、有版本 tag / npm 发布 | ✅ npm `0.3.1` + GitHub release `v0.3.1` |
-| 开源 + LICENSE | ✅ MIT |
-| `dsh-plugin` topic | ✅ 已设置（另有 `cordis-plugin` `deepseek-harness` `prompt-management` `system-prompt`）|
-| 不重复 | ✅ 目录里没有我们的条目 |
-| 一句话价值主张 | ✅ 见下 |
-| UI 截图 / GIF | ❌ **待补**（见文末） |
-| 双语（README + README.zh.md 都改） | 待提交时两处都加 |
+| `docs/awesome-dsh/elfmingh__dsh-prompt-manager.yml` | `data/plugins/elfmingh__dsh-prompt-manager.yml` |
+| `docs/awesome-dsh/pr-body.md` | PR 正文，不是仓库文件 |
 
-## 分类
+条目内容：
 
-`🧩 Tools, Workflows & Presets`
-
-理由：核心能力是「提示词档案的分层投放与覆盖」，属于预设/配置管理；虽然有 Web 面板，但面板只是操作界面，不是用途本身。放在 `🎨 Web UI` 分类反而会让想找提示词管理功能的人找不到。
-
-## 位置
-
-该分类表格按 star 降序排列（5839 / 1307 / 199 / 194 …）。我们 **1 star**，插在表格末尾。
-
----
-
-## `README.md`（英文）— 插入一行
-
-```markdown
-| [elfmingh/dsh-prompt-manager](https://github.com/elfmingh/dsh-prompt-manager) | Layered prompt profiles (global / workspace / session) with builtin-section override, subagent scope and line-level diff; `dsh plugin --profile web add @vertixara/dsh-prompt-manager` | 1 |
+```yaml
+url: https://github.com/elfmingh/dsh-prompt-manager
+name: elfmingh/dsh-prompt-manager
+category: identity
+description:
+  en: ...
+  zh: ...
 ```
 
-## `README.zh.md`（中文）— 同一位置插入一行
+字段只有 `url` / `name` / `category` / `description.{en,zh}`。
+`description.en` 是唯一必填项，`zh` 可选（缺了维护者会补）。
+**不要**写 `npm:` —— 那个字段会被校验直接拒绝，npm 映射是从 registry 自动采集的，
+前提是包的 `repository` 字段指回本仓库（我们的已指向）。
 
-```markdown
-| [elfmingh/dsh-prompt-manager](https://github.com/elfmingh/dsh-prompt-manager) | 分层提示词档案（全局 / 工作区 / 会话），支持内置段落禁用与覆盖、子代理作用域、逐行 diff；`dsh plugin --profile web add @vertixara/dsh-prompt-manager` 安装 | 1 |
-```
-
----
+分类选 `identity` 的理由：列表里做「提示词注入 / agent 指令」的插件都在这一类
+（`dsh-prompt-inject`、`dsh-agent-instructions`）。规范明说分类选得不够准由维护者
+直接改、不会打回，所以不必纠结。
 
 ## PR 标题
 
 ```
-Add elfmingh/dsh-prompt-manager to Tools, Workflows & Presets
+Add elfmingh/dsh-prompt-manager
 ```
 
-## PR 正文
+这个仓库的 `contributing.md` 没有规定标题格式（`Add owner/repo to Category` 那条是
+另一个仓库的规矩）。保持上面的形式即可。
 
-```markdown
-**Relation to DSH**
+## 提交流程
 
-DSH Web plugin. Registers a `prompt_manager` tool, a `/prompt-manager/api` route on the
-host `webServer`, and hooks `system-prompt/assemble` to rewrite sections and contexts.
-It also registers static sections via `systemPrompt.section()` for new agents.
+```bash
+gh repo fork awesome-dsh-plugin/awesome-dsh-plugin --clone
+cd awesome-dsh-plugin
+git checkout -b add-elfmingh-dsh-prompt-manager
 
-What it does: prompt entries delivered at three levels (global / workspace / session),
-plus the ability to disable or override any builtin section or runtime context that
-Harness or other plugins registered — with a line-level diff for every change.
+cp /path/to/dsh-prompt-manager/docs/awesome-dsh/elfmingh__dsh-prompt-manager.yml \
+   data/plugins/elfmingh__dsh-prompt-manager.yml
 
-**Install (verified on 0.3.1)**
+git add data/plugins/elfmingh__dsh-prompt-manager.yml
+git commit -m "Add elfmingh/dsh-prompt-manager"
+git push -u origin add-elfmingh-dsh-prompt-manager
 
-```
-dsh plugin --profile web add @vertixara/dsh-prompt-manager
-```
-
-npm: `@vertixara/dsh-prompt-manager@0.3.1`
-Release: https://github.com/elfmingh/dsh-prompt-manager/releases/tag/v0.3.1
-
-**License**: MIT · **Topic**: `dsh-plugin` set (also `cordis-plugin`, `deepseek-harness`,
-`prompt-management`, `system-prompt`) · **Stars**: 1 (as of 2026-10-29)
-
-**Why this category rather than Web UI**
-
-The panel is just a shell; the product is prompt profile management. Someone looking
-for "how do I pin an instruction to every session" looks under tools/presets, not skins.
-
-**No duplicate**: searched `elfmingh/dsh-prompt-manager` in both README.md and README.zh.md — absent.
+gh pr create \
+  --repo awesome-dsh-plugin/awesome-dsh-plugin \
+  --title "Add elfmingh/dsh-prompt-manager" \
+  --body-file /path/to/dsh-prompt-manager/docs/awesome-dsh/pr-body.md
 ```
 
----
+## 逐条核对
 
-## UI 截图（已备）
+| CI 检查 | 我们的状态 |
+|---|---|
+| 一个 PR 最多 3 条 | 1 条 |
+| `package.json` 声明 `dsh.bundle` | ✅ `{ "bundle": { "patch": "./cordis.patch.yml" } }`，`cordis.patch.yml` 在仓库根 |
+| 仓库创建满 1 天 | ✅ 2026-10-23，已 7 天 |
+| `awesome-lint` / 站点构建 | 字段用最小集，YAML 已用 `yaml` 包解析验证 |
+| `category` 在允许集内 | ✅ `identity` |
+| `dsh-plugin` topic | ✅（另有 `cordis-plugin` `deepseek-harness` `prompt-management` `system-prompt`） |
+| 无重复条目 | ✅ 三页 `data/plugins/` 全查过，无 `elfmingh` |
+| 描述属实、无营销词 | 见下 |
 
-已放在仓库 `docs/screenshot-panel.png`（86 KB，2175×731，深色主题），README 顶部已引用。
+**描述会是评审最认真核对的一项**，规范写得很直白：它被当作对插件的声明，并与代码
+对照；夸大是让一个本来不错的插件被打回的主要原因。所以 PR 正文里主动列了一张
+「每条声明对应代码的哪个位置」的表 —— 能省掉评审一轮来回。
 
-因为它不在 `package.json` 的 `files` 里（图片不进 npm 包），README 用的是 **GitHub 绝对 URL** 而不是相对路径，这样 npm 页面上的图也能显示：
+## 各条声明的出处
 
-```
-https://raw.githubusercontent.com/elfmingh/dsh-prompt-manager/main/docs/screenshot-panel.png
-```
+| 声明 | 位置 |
+|---|---|
+| 全局 / 工作区 / 会话 三级档案 | `index.js` 的 library 层与 `applications.workspaces` |
+| 按 `order` 注入 | 条目 `order` 字段，装配时排序 |
+| 禁用 / 覆盖内置段落与运行期 context | `override.set` / `override.clear`，`layer` 取 `section` 或 `context` |
+| 覆盖的逐行 diff | `client.js` 的 `diffBlocks` / `renderDiffView` |
+| 子代理作用域 | 条目 `agentScope`：`main` / `subagent` / `inherit` |
+| Web 面板 + `prompt_manager` 工具 | `sidebar.panellist` / `conversation.view` 槽位；工具定义 |
 
-截图内容：左侧档案库（2 条）、右侧投放区（全局 chips + 工作区下拉 + 拖放区）、底部 store 路径。一张图同时说明了「三级投放」和「拖拽即应用」这两件事。
+## 可选但没做
 
-PR 正文里贴这个 URL 即可。
+- **`icon:`** —— 需要 GitHub 托管的位图（png/jpg/webp），约 96px 方形最清楚，
+  SVG 会被拒。我们仓库的 `icon.svg` 用不了，`docs/screenshot-panel.png` 是 2175×731
+  的长条。不写则回退到作者头像，先空着。
+- **`screenshots.json`** —— 规范推荐放在我们仓库 `package.json` 旁边，1–8 张图。
+  不写也没关系，市场会从 README 自动抽取（我们 README 顶部就有截图）。
+  想要更好的展示效果再加，这不属于本 PR 的内容。
+- **`tarball:`** —— 只在自己不发 npm 时才需要，我们发了 0.4.1。
 
-## 其他五个目录
+## 其他候选仓库（格式各不相同，别照抄这份）
 
-同一套标题/正文/行照抄即可，分类名可能不同（有的用 "Tools" 或 "工具"），
-提交前各自读一遍它的 CONTRIBUTING。**一次一 PR、一次一条目**，别合在一起。
+| 仓库 | 条目格式 |
+|---|---|
+| awesome-deepseekharness/awesome-deepseek-harness | 两份 README 表格行 + PR 模板 |
+| kejixiaoliang/awesome-dsh-plugins | `plugins/*.md` 分类文件 |
+| beancookie/awesome-dsh-plugin | `data/*.json` |
+| ysr666/awesome-dsh-plugin-1 | `CATALOG.md` + `data/` |
+| billliao/awesome-dsh-plugin | `categories/*.md` + `data/plugins.json` |
+
+投别家的话，标题和描述可以复用，但**格式要重新按对方规范写** —— 没有一个是
+`data/plugins/*.yml`。一次一 PR、一次一条目。
